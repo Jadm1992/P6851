@@ -64,6 +64,7 @@ pub struct TelemetrySnapshot {
     pub global_window: usize,
     pub violation_count: u32,
     pub in_flight: usize,
+    pub epoch_duration: Duration,
 }
 
 /// The integrated adaptive engine.
@@ -82,6 +83,9 @@ pub struct AdaptiveEngine {
 
     // Epoch tracking
     epoch_start: Timestamp,
+    /// Observation epoch duration latched when the epoch opens (§ 3.1).
+    /// Retained until the epoch closes for reproducible observation windows.
+    current_epoch_duration: Duration,
     epoch_acc: EpochAccumulator,
     epoch_events: EpochEvents,
     /// Snapshotted baseline SRTT at epoch start for change detection (§ 1.5).
@@ -98,6 +102,7 @@ impl AdaptiveEngine {
         let change_detector = ChangeDetector::new(&cfg);
         let concurrency = ConcurrencyController::new(&cfg);
         let loss = LossMonitor::new(&cfg);
+        let current_epoch_duration = cfg.epoch_duration(None);
 
         Self {
             cfg,
@@ -107,6 +112,7 @@ impl AdaptiveEngine {
             concurrency,
             loss,
             epoch_start: now,
+            current_epoch_duration,
             epoch_acc: EpochAccumulator::new(),
             epoch_events: EpochEvents::default(),
             baseline_srtt: Duration::ZERO,
@@ -144,6 +150,26 @@ impl AdaptiveEngine {
         &self.loss
     }
 
+    /// The snapshotted baseline SRTT used by the change detector for the active epoch.
+    #[inline]
+    pub fn baseline_srtt(&self) -> Duration {
+        self.baseline_srtt
+    }
+
+    /// The snapshotted baseline RTTVAR used by the change detector for the active epoch.
+    #[inline]
+    pub fn baseline_rttvar(&self) -> Duration {
+        self.baseline_rttvar
+    }
+
+    /// The duration of the currently active observation epoch (§ 3.1).
+    ///
+    /// Fixed when the epoch opens and retained until it closes.
+    #[inline]
+    pub fn current_epoch_duration(&self) -> Duration {
+        self.current_epoch_duration
+    }
+
     /// Check if a probe can be dispatched to a destination under dual ceilings (§ 3.3).
     #[inline]
     pub fn can_dispatch(&self, dest_id: u64) -> bool {
@@ -176,6 +202,18 @@ impl AdaptiveEngine {
         } else {
             ProbeRetrySchedule::new(&self.cfg, None, None)
         }
+    }
+
+    /// Create a latched per-probe retry schedule for a specific destination.
+    ///
+    /// Incorporates destination-level backoff state (§ 2.3) if the destination
+    /// has accumulated unacknowledged retries/losses.
+    pub fn latch_dest_retry_schedule(&self, dest_id: u64) -> ProbeRetrySchedule {
+        let mut sched = self.latch_retry_schedule();
+        if let Some(dest) = self.concurrency.get_dest(dest_id).filter(|d| d.consecutive_backoffs > 0) {
+            sched.base_rto = sched.rto_for_attempt(dest.consecutive_backoffs);
+        }
+        sched
     }
 
     /// Record a probe outcome for the default global destination.
@@ -224,25 +262,21 @@ impl AdaptiveEngine {
 
     /// Advance the epoch clock. Call this periodically.
     ///
+    /// Uses the reproducible epoch duration latched when the epoch opened.
     /// If sufficient time has elapsed (≥ epoch duration), closes the current
-    /// epoch and opens a new one, applying all state transitions.
+    /// epoch, opens a new one, and latches the next epoch duration.
     ///
     /// Returns `true` if an epoch was closed.
     pub fn tick(&mut self, now: Timestamp) -> bool {
-        let srtt_opt = if self.rtt.is_initialized() {
-            Some(self.rtt.srtt())
-        } else {
-            None
-        };
-        let epoch_dur = self.cfg.epoch_duration(srtt_opt);
         let elapsed = now.duration_since(self.epoch_start);
 
-        if elapsed < epoch_dur {
+        if elapsed < self.current_epoch_duration {
             return false;
         }
 
         self.close_epoch(elapsed);
         self.epoch_start = now;
+        self.current_epoch_duration = self.next_epoch_duration();
         true
     }
 
@@ -251,6 +285,7 @@ impl AdaptiveEngine {
         let elapsed = now.duration_since(self.epoch_start);
         self.close_epoch(elapsed);
         self.epoch_start = now;
+        self.current_epoch_duration = self.next_epoch_duration();
     }
 
     /// Get a complete telemetry snapshot.
@@ -266,10 +301,22 @@ impl AdaptiveEngine {
             global_window: self.concurrency.global.window(),
             violation_count: self.change_detector.violation_count(),
             in_flight: self.concurrency.global_in_flight,
+            epoch_duration: self.current_epoch_duration,
         }
     }
 
     // ── Private ──────────────────────────────────────────────────────────
+
+    /// Calculate the epoch duration for an opening epoch (§ 3.1).
+    #[inline]
+    fn next_epoch_duration(&self) -> Duration {
+        let srtt_opt = if self.rtt.is_initialized() {
+            Some(self.rtt.srtt())
+        } else {
+            None
+        };
+        self.cfg.epoch_duration(srtt_opt)
+    }
 
     fn close_epoch(&mut self, elapsed: Duration) {
         // If this is the first epoch with samples, seed the baseline
@@ -279,20 +326,38 @@ impl AdaptiveEngine {
         }
 
         // § 1.5 — Change detection against snapshotted baseline (Adaptive mode only)
-        if self.change_detector.is_enabled() && self.baseline_srtt > Duration::ZERO {
-            let result = self.change_detector.close_epoch(
+        let change_result = if self.change_detector.is_enabled() && self.baseline_srtt > Duration::ZERO {
+            self.change_detector.close_epoch(
                 &self.epoch_acc,
                 self.baseline_srtt,
                 self.baseline_rttvar,
-            );
-            if let EpochCloseResult::ReAnchor {
+            )
+        } else {
+            EpochCloseResult::Normal
+        };
+
+        // Baseline action policy strictly enforced per contract:
+        // - Normal: Refresh baseline from current RTT estimator state
+        // - Violation: Preserve existing baseline (do NOT contaminate reference point)
+        // - InsufficientSamples: Preserve existing baseline
+        // - ReAnchor: Replace baseline with re-anchored values
+        match change_result {
+            EpochCloseResult::ReAnchor {
                 new_srtt,
                 new_rttvar,
-            } = result
-            {
+            } => {
                 self.rtt.force_reanchor(new_srtt, new_rttvar);
                 self.baseline_srtt = new_srtt;
                 self.baseline_rttvar = new_rttvar;
+            }
+            EpochCloseResult::Normal => {
+                if self.rtt.is_initialized() {
+                    self.baseline_srtt = self.rtt.srtt();
+                    self.baseline_rttvar = self.rtt.rttvar();
+                }
+            }
+            EpochCloseResult::Violation { .. } | EpochCloseResult::InsufficientSamples => {
+                // Strictly preserve existing baseline without updating.
             }
         }
 
@@ -303,12 +368,6 @@ impl AdaptiveEngine {
         // § 4.2 — Time-normalized loss EWMA update
         // In Reference profile, acts as passive telemetry
         self.loss.update(&self.epoch_events, elapsed);
-
-        // Snapshot baseline SRTT / RTTVAR for the NEXT epoch's change detection
-        if self.rtt.is_initialized() {
-            self.baseline_srtt = self.rtt.srtt();
-            self.baseline_rttvar = self.rtt.rttvar();
-        }
 
         // Reset epoch accumulators
         self.epoch_acc.reset();
@@ -452,5 +511,86 @@ mod tests {
 
         // Re-anchor should have kicked in
         assert!(engine.rtt().srtt() >= Duration::from_millis(250));
+    }
+
+    #[test]
+    fn baseline_preservation_during_violations() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        // Initialize at 50ms
+        engine.record_outcome(ProbeOutcome::SuccessInitial {
+            rtt: Duration::from_millis(50),
+        });
+        engine.tick(ts(100));
+
+        let baseline_at_start = engine.baseline_srtt();
+        assert_eq!(baseline_at_start, Duration::from_millis(50));
+
+        // Epoch with a violation (samples at 400ms > 50 + 3*25 = 125ms)
+        for _ in 0..5 {
+            engine.record_outcome(ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(400),
+            });
+        }
+        engine.tick(ts(200));
+
+        // RTT estimator has updated its internal SRTT (clamped)
+        assert!(engine.rtt().srtt() > Duration::from_millis(50));
+        // BUT the baseline must strictly be preserved!
+        assert_eq!(
+            engine.baseline_srtt(),
+            baseline_at_start,
+            "Baseline must NOT be contaminated during a violation epoch"
+        );
+    }
+
+    #[test]
+    fn reproducible_epoch_duration() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        // Uninitialized: latches epoch_e_init (100ms)
+        assert_eq!(engine.current_epoch_duration(), Duration::from_millis(100));
+
+        // In the middle of epoch, record a sample at 500ms
+        engine.record_outcome(ProbeOutcome::SuccessInitial {
+            rtt: Duration::from_millis(500),
+        });
+
+        // Even though SRTT changed to 500ms, current_epoch_duration remains 100ms
+        assert_eq!(engine.current_epoch_duration(), Duration::from_millis(100));
+
+        // Advance by 99ms: tick should NOT close epoch yet
+        assert!(!engine.tick(ts(99)));
+
+        // Advance to 100ms: closes epoch
+        assert!(engine.tick(ts(100)));
+
+        // NEW epoch now opens, latching the new duration based on SRTT (500ms)
+        assert_eq!(engine.current_epoch_duration(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn destination_retry_schedule_backoff() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let d1 = 42;
+        engine.record_outcome(ProbeOutcome::SuccessInitial {
+            rtt: Duration::from_millis(100),
+        });
+
+        let sched_normal = engine.latch_dest_retry_schedule(d1);
+
+        // Record drops on d1
+        engine.record_dest_outcome(d1, ProbeOutcome::InferredLoss);
+        let sched_backed_off = engine.latch_dest_retry_schedule(d1);
+
+        // Backed off base RTO should be higher than normal base RTO
+        assert!(
+            sched_backed_off.base_rto > sched_normal.base_rto,
+            "Destination retry schedule should reflect destination backoff state"
+        );
     }
 }
