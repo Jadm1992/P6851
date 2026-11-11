@@ -83,7 +83,14 @@ impl EpochEvents {
 
 impl LossMonitor {
     /// Create a new monitor with zero initial estimates.
+    ///
+    /// # Panics
+    /// Panics if `cfg.ewma_tau` is zero or non-positive per the configuration contract.
     pub fn new(cfg: &AdaptiveConfig) -> Self {
+        assert!(
+            cfg.ewma_tau > Duration::ZERO,
+            "LossMonitor requires strictly positive ewma_tau"
+        );
         Self {
             d_loss: 0.0,
             d_rate_limit: 0.0,
@@ -128,10 +135,11 @@ impl LossMonitor {
     /// Compute the time-normalized smoothing factor λ(Δt) = 1 − exp(−Δt/τ).
     #[inline]
     fn lambda(&self, dt: Duration) -> f64 {
+        debug_assert!(
+            self.tau_secs > 0.0,
+            "tau_secs must be strictly positive per configuration contract"
+        );
         let dt_secs = dt.as_secs_f64();
-        if self.tau_secs <= 0.0 {
-            return 1.0; // Instant convergence if τ = 0.
-        }
         crate::math::one_minus_exp_neg(dt_secs / self.tau_secs)
     }
 }
@@ -149,6 +157,80 @@ mod tests {
         mon.update(&events, Duration::from_millis(100));
         assert_eq!(mon.d_loss(), 0.0);
         assert_eq!(mon.d_rate_limit(), 0.0);
+    }
+
+    #[test]
+    fn empty_epoch_preserves_nonzero_estimates() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut mon = LossMonitor::new(&cfg);
+
+        // Prime the monitor with non-zero loss and rate-limit estimates.
+        let seed_events = EpochEvents {
+            successes: 7,
+            expected_silence: 0,
+            inferred_loss: 2,
+            inferred_rate_limit: 1,
+            unclassified: 0,
+        };
+        mon.update(&seed_events, Duration::from_millis(500));
+        let initial_loss = mon.d_loss();
+        let initial_rate = mon.d_rate_limit();
+        assert!(initial_loss > 0.0, "seed loss should be non-zero");
+        assert!(initial_rate > 0.0, "seed rate-limit should be non-zero");
+
+        // 1. Epoch containing only ExpectedSilence (0 eligible probes).
+        let silence_epoch = EpochEvents {
+            successes: 0,
+            expected_silence: 50,
+            inferred_loss: 0,
+            inferred_rate_limit: 0,
+            unclassified: 0,
+        };
+        mon.update(&silence_epoch, Duration::from_secs(5));
+        assert_eq!(
+            mon.d_loss(),
+            initial_loss,
+            "ExpectedSilence must not alter d_loss"
+        );
+        assert_eq!(
+            mon.d_rate_limit(),
+            initial_rate,
+            "ExpectedSilence must not alter d_rate_limit"
+        );
+
+        // 2. Epoch containing only Unclassified outcomes (0 eligible probes).
+        let unclassified_epoch = EpochEvents {
+            successes: 0,
+            expected_silence: 0,
+            inferred_loss: 0,
+            inferred_rate_limit: 0,
+            unclassified: 25,
+        };
+        mon.update(&unclassified_epoch, Duration::from_secs(10));
+        assert_eq!(
+            mon.d_loss(),
+            initial_loss,
+            "Unclassified outcomes must not alter d_loss"
+        );
+        assert_eq!(
+            mon.d_rate_limit(),
+            initial_rate,
+            "Unclassified outcomes must not alter d_rate_limit"
+        );
+
+        // 3. Completely empty epoch (0 probes of any kind).
+        let empty_epoch = EpochEvents::default();
+        mon.update(&empty_epoch, Duration::from_secs(1));
+        assert_eq!(
+            mon.d_loss(),
+            initial_loss,
+            "Default/empty epoch must preserve d_loss"
+        );
+        assert_eq!(
+            mon.d_rate_limit(),
+            initial_rate,
+            "Default/empty epoch must preserve d_rate_limit"
+        );
     }
 
     #[test]
@@ -193,51 +275,73 @@ mod tests {
     fn time_normalization_invariance() {
         let cfg = AdaptiveConfig::adaptive();
 
-        // Two monitors, same events, different Δt
+        // Mathematical invariance property:
+        // For constant empirical rates p̂_loss and p̂_rate_limit, equal elapsed total time
+        // must produce identical EWMA estimates regardless of update frequency.
+        // That is, updating 10 times with Δt = 100 ms must mathematically equal
+        // updating 1 time with Δt = 1000 ms = 1 s:
+        //   D_10 = p - (1 - λ(0.1))^10 * (p - D_0)
+        //        = p - (e^(-0.1/τ))^10 * (p - D_0)
+        //        = p - e^(-1.0/τ) * (p - D_0)
+        //        = D_1
         let mut mon_fast = LossMonitor::new(&cfg);
         let mut mon_slow = LossMonitor::new(&cfg);
 
         let events = EpochEvents {
-            successes: 9,
+            successes: 7,
             expected_silence: 0,
-            inferred_loss: 1,
-            inferred_rate_limit: 0,
+            inferred_loss: 2,
+            inferred_rate_limit: 1,
             unclassified: 0,
         };
 
-        // Fast: 10 updates at Δt = 100ms
+        // Fast: 10 updates at Δt = 100ms (total = 1.0s)
         for _ in 0..10 {
             mon_fast.update(&events, Duration::from_millis(100));
         }
 
-        // Slow: 1 update at Δt = 1s
+        // Slow: 1 update at Δt = 1s (total = 1.0s)
         mon_slow.update(&events, Duration::from_secs(1));
 
-        // They should NOT be exactly equal (time-normalization ensures consistent
-        // behavior, but multiple updates accumulate differently). The key property
-        // is that the fast monitor converges to the same steady state as the slow one.
-        // After many updates both should converge to the same value.
-        let events_many = EpochEvents {
+        // Directly assert mathematical invariance for both estimators:
+        assert!(
+            (mon_fast.d_loss() - mon_slow.d_loss()).abs() < 1e-12,
+            "Time normalization invariance violation for d_loss: fast={} slow={}",
+            mon_fast.d_loss(),
+            mon_slow.d_loss()
+        );
+        assert!(
+            (mon_fast.d_rate_limit() - mon_slow.d_rate_limit()).abs() < 1e-12,
+            "Time normalization invariance violation for d_rate_limit: fast={} slow={}",
+            mon_fast.d_rate_limit(),
+            mon_slow.d_rate_limit()
+        );
+
+        // Also verify when starting from a pre-existing non-zero estimate:
+        let mut mon_fast_seeded = mon_fast;
+        let mut mon_slow_seeded = mon_slow;
+
+        let new_events = EpochEvents {
             successes: 9,
             expected_silence: 0,
             inferred_loss: 1,
             inferred_rate_limit: 0,
             unclassified: 0,
         };
-        for _ in 0..100 {
-            mon_fast.update(&events_many, Duration::from_millis(100));
-            // 10 fast updates ≈ 1 slow update
-            if mon_fast.d_loss() > 0.0 {
-                // Just ensure it converges somewhere positive
-            }
-        }
-        for _ in 0..10 {
-            mon_slow.update(&events_many, Duration::from_secs(1));
-        }
 
-        // Both should have converged close to 0.1 (the true rate)
-        assert!((mon_fast.d_loss() - 0.1).abs() < 0.01);
-        assert!((mon_slow.d_loss() - 0.1).abs() < 0.01);
+        for _ in 0..10 {
+            mon_fast_seeded.update(&new_events, Duration::from_millis(100));
+        }
+        mon_slow_seeded.update(&new_events, Duration::from_secs(1));
+
+        assert!(
+            (mon_fast_seeded.d_loss() - mon_slow_seeded.d_loss()).abs() < 1e-12,
+            "Time normalization invariance from non-zero state for d_loss"
+        );
+        assert!(
+            (mon_fast_seeded.d_rate_limit() - mon_slow_seeded.d_rate_limit()).abs() < 1e-12,
+            "Time normalization invariance from non-zero state for d_rate_limit"
+        );
     }
 
     #[test]
