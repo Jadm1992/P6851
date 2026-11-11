@@ -34,12 +34,14 @@ pub struct EpochEvents {
     pub inferred_loss: usize,
     /// Number of inferred-rate-limit outcomes.
     pub inferred_rate_limit: usize,
+    /// Number of unclassified / aborted outcomes (excluded from all ratios).
+    pub unclassified: usize,
 }
 
 impl EpochEvents {
     /// Total eligible probes for loss-rate computation.
     ///
-    /// Excludes `ExpectedSilence` since those are not loss indicators.
+    /// Excludes `ExpectedSilence` and `Unclassified` since those are not loss indicators.
     #[inline]
     pub fn eligible_count(&self) -> usize {
         self.successes + self.inferred_loss + self.inferred_rate_limit
@@ -71,10 +73,11 @@ impl EpochEvents {
         self.inferred_loss > 0 || self.inferred_rate_limit > 0
     }
 
-    /// Whether any probes completed (success or loss).
+    /// Whether at least `min_completed` probes completed (success or loss).
     #[inline]
-    pub fn has_completions(&self) -> bool {
-        self.successes > 0 || self.inferred_loss > 0 || self.inferred_rate_limit > 0
+    pub fn has_completions(&self, min_completed: usize) -> bool {
+        let total = self.successes + self.inferred_loss + self.inferred_rate_limit;
+        total >= min_completed && total > 0
     }
 }
 
@@ -129,7 +132,7 @@ impl LossMonitor {
         if self.tau_secs <= 0.0 {
             return 1.0; // Instant convergence if τ = 0.
         }
-        1.0 - (-dt_secs / self.tau_secs).exp()
+        crate::math::one_minus_exp_neg(dt_secs / self.tau_secs)
     }
 }
 
@@ -157,6 +160,7 @@ mod tests {
             expected_silence: 0,
             inferred_loss: 2,
             inferred_rate_limit: 0,
+            unclassified: 0,
         };
         // p̂_loss = 2/10 = 0.2
         mon.update(&events, Duration::from_secs(1));
@@ -176,6 +180,7 @@ mod tests {
             expected_silence: 3,
             inferred_loss: 0,
             inferred_rate_limit: 5,
+            unclassified: 0,
         };
         // eligible = 5 + 5 = 10, p̂_rate = 5/10 = 0.5
         mon.update(&events, Duration::from_secs(1));
@@ -197,6 +202,7 @@ mod tests {
             expected_silence: 0,
             inferred_loss: 1,
             inferred_rate_limit: 0,
+            unclassified: 0,
         };
 
         // Fast: 10 updates at Δt = 100ms
@@ -216,6 +222,7 @@ mod tests {
             expected_silence: 0,
             inferred_loss: 1,
             inferred_rate_limit: 0,
+            unclassified: 0,
         };
         for _ in 0..100 {
             mon_fast.update(&events_many, Duration::from_millis(100));
@@ -246,6 +253,7 @@ mod tests {
             expected_silence: 0,
             inferred_loss: 1,
             inferred_rate_limit: 0,
+            unclassified: 0,
         };
         mon.update(&events, dt);
         // λ(Δt₀) = 1 − exp(−ln(10/9)) = 1 − 9/10 = 0.1
@@ -264,6 +272,7 @@ mod tests {
             expected_silence: 10,
             inferred_loss: 0,
             inferred_rate_limit: 0,
+            unclassified: 0,
         };
         // Only 5 eligible (successes). ExpectedSilence not counted.
         assert_eq!(events.eligible_count(), 5);

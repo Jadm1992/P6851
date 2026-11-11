@@ -7,16 +7,46 @@ use core::time::Duration;
 /// Selects between strict RFC 6298 semantics and the adaptive scanner profile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProfileMode {
-    /// Strict RFC 6298: unclamped SRTT, 1 s RTO floor, 2× backoff, no change detector.
+    /// Strict RFC 6298: unclamped SRTT, 1 s RTO floor, 2× backoff, no change detector,
+    /// fixed concurrency (caller-supplied ceiling), passive loss telemetry only.
     Reference,
-    /// Scanner-optimized: clamped SRTT, aggressive RTO bounds, γ-backoff, change detector.
+    /// Scanner-optimized: clamped SRTT, aggressive RTO bounds, γ-backoff, change detector,
+    /// epoch-based AIMD concurrency with dual ceilings, time-normalized loss EWMA.
     Adaptive,
+}
+
+// ─── Policy for Rate-Limit vs Packet-Loss in AIMD ──────────────────────────
+
+/// Policy determining how rate-limiting vs packet-loss events affect AIMD window backoff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AimdLossPolicy {
+    /// Both packet loss and rate-limiting trigger window decrease using `aimd_delta`.
+    /// This is the baseline contract specified in § 3.2.
+    Shared,
+    /// Rate-limit signals trigger window reduction with a separate delta multiplier
+    /// (e.g. 0.7 instead of 0.5), allowing distinct response tuning.
+    SeparateRateLimit { rate_limit_delta: f64 },
+    /// Only inferred packet drops trigger AIMD window decrease; rate-limiting is
+    /// tracked in telemetry only (or handled at higher application layers).
+    LossOnly,
+}
+
+// ─── Re-Anchor Strategy for Change Detector ────────────────────────────────
+
+/// Strategy for computing new RTTVAR during a forced unclamped re-anchor (§ 1.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReanchorVariationStrategy {
+    /// Spec default: RTTVAR = max(RTTVAR_min, |M_e - SRTT_baseline| / 2)
+    MedianStep,
+    /// Empirical spread: RTTVAR = max(RTTVAR_min, MAD(samples, M_e))
+    /// where MAD is the Mean Absolute Deviation of the violating epoch samples around M_e.
+    EpochSampleVariation,
 }
 
 // ─── Adaptive Config ────────────────────────────────────────────────────────
 
 /// Complete parameterization of the estimator, backoff, concurrency, and loss
-/// tracking subsystems.  All fields are `pub` for trace-driven replay.
+/// tracking subsystems. All fields are `pub` for trace-driven replay.
 #[derive(Clone, Copy, Debug)]
 pub struct AdaptiveConfig {
     pub mode: ProfileMode,
@@ -42,9 +72,12 @@ pub struct AdaptiveConfig {
     pub change_c: f64,          // deviation threshold multiplier (default 3.0)
     pub change_m_epochs: u32,   // consecutive violations before re-anchor (default 3)
     pub min_epoch_samples: usize, // minimum samples for a valid epoch (default 3)
+    pub reanchor_strategy: ReanchorVariationStrategy,
 
     // § 3 — AIMD concurrency
     pub aimd_delta: f64, // multiplicative decrease factor [0.4, 0.5]
+    pub aimd_loss_policy: AimdLossPolicy,
+    pub min_completed_probes: usize, // minimum completions in epoch to qualify for +1 increase (default 1)
     pub c_min_dest: usize,
     pub c_max_dest: usize,
     pub c_min_global: usize,
@@ -79,7 +112,10 @@ impl AdaptiveConfig {
             change_c: 3.0,
             change_m_epochs: 3,
             min_epoch_samples: 3,
+            reanchor_strategy: ReanchorVariationStrategy::MedianStep,
             aimd_delta: 0.5,
+            aimd_loss_policy: AimdLossPolicy::Shared,
+            min_completed_probes: 1,
             c_min_dest: 1,
             c_max_dest: 256,
             c_min_global: 1,
@@ -108,7 +144,10 @@ impl AdaptiveConfig {
             change_c: 3.0,
             change_m_epochs: 3,
             min_epoch_samples: 3,
+            reanchor_strategy: ReanchorVariationStrategy::MedianStep,
             aimd_delta: 0.5,
+            aimd_loss_policy: AimdLossPolicy::Shared,
+            min_completed_probes: 1,
             c_min_dest: 1,
             c_max_dest: 256,
             c_min_global: 1,
@@ -162,6 +201,9 @@ pub enum ProbeOutcome {
     InferredLoss,
     /// Inferred target/middlebox rate limit. Triggers AIMD decrease & D_rate_limit update.
     InferredRateLimit,
+    /// Unclassified or aborted probe (e.g. caller cancelled, socket unroutable).
+    /// Excluded from loss calculations and AIMD transitions.
+    Unclassified,
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

@@ -47,7 +47,16 @@ impl ProbeRetrySchedule {
     /// Adaptive profile (γ=1.5): RTO_n = min(RTO_max, RTO_0 · 1.5ⁿ)
     #[inline]
     pub fn rto_for_attempt(&self, n: u32) -> Duration {
-        let factor = self.gamma.powi(n as i32);
+        if n == 0 {
+            return self.base_rto;
+        }
+        // Bound attempt count to prevent exponential float overflow/wrap.
+        // For gamma >= 1.4, gamma^64 is enormous and will exceed rto_max anyway.
+        let clamped_n = n.min(64);
+        let factor = crate::math::pow_f64_u32(self.gamma, clamped_n);
+        if factor.is_infinite() {
+            return self.rto_max;
+        }
         let scaled = self.base_rto.mul_f64(factor);
         scaled.min(self.rto_max)
     }

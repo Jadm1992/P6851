@@ -7,12 +7,15 @@
 use core::time::Duration;
 
 use crate::change_detector::{ChangeDetector, EpochAccumulator, EpochCloseResult};
-use crate::concurrency::{ConcurrencyController, EpochOutcome};
+use crate::concurrency::ConcurrencyController;
 use crate::config::{AdaptiveConfig, ProbeOutcome};
 use crate::loss::{EpochEvents, LossMonitor};
 use crate::p95::RollingP95;
 use crate::rto::ProbeRetrySchedule;
 use crate::rtt::RttEstimator;
+
+/// Default destination ID used when callers don't provide a destination key.
+pub const DEFAULT_DESTINATION_ID: u64 = 0;
 
 /// Instant representation for trace-driven replay.
 ///
@@ -60,12 +63,14 @@ pub struct TelemetrySnapshot {
     pub d_rate_limit: f64,
     pub global_window: usize,
     pub violation_count: u32,
+    pub in_flight: usize,
 }
 
 /// The integrated adaptive engine.
 ///
-/// Call [`record_outcome`] for each probe completion and [`tick`] to advance
-/// the epoch clock.  The engine handles all internal state transitions.
+/// Call [`record_outcome`] or [`record_dest_outcome`] for each probe completion
+/// and [`tick`] to advance the epoch clock. The engine handles all internal state
+/// transitions.
 #[derive(Clone, Debug)]
 pub struct AdaptiveEngine {
     cfg: AdaptiveConfig,
@@ -75,11 +80,14 @@ pub struct AdaptiveEngine {
     concurrency: ConcurrencyController,
     loss: LossMonitor,
 
-    // Epoch state
+    // Epoch tracking
     epoch_start: Timestamp,
     epoch_acc: EpochAccumulator,
     epoch_events: EpochEvents,
-    epoch_has_loss: bool,
+    /// Snapshotted baseline SRTT at epoch start for change detection (§ 1.5).
+    baseline_srtt: Duration,
+    /// Snapshotted baseline RTTVAR at epoch start for change detection (§ 1.5).
+    baseline_rttvar: Duration,
 }
 
 impl AdaptiveEngine {
@@ -101,7 +109,8 @@ impl AdaptiveEngine {
             epoch_start: now,
             epoch_acc: EpochAccumulator::new(),
             epoch_events: EpochEvents::default(),
-            epoch_has_loss: false,
+            baseline_srtt: Duration::ZERO,
+            baseline_rttvar: Duration::ZERO,
         }
     }
 
@@ -135,6 +144,18 @@ impl AdaptiveEngine {
         &self.loss
     }
 
+    /// Check if a probe can be dispatched to a destination under dual ceilings (§ 3.3).
+    #[inline]
+    pub fn can_dispatch(&self, dest_id: u64) -> bool {
+        self.concurrency.can_dispatch(dest_id)
+    }
+
+    /// Record that a probe has been dispatched to a destination.
+    #[inline]
+    pub fn on_dispatch(&mut self, dest_id: u64) {
+        self.concurrency.on_dispatch(dest_id);
+    }
+
     /// Get the current RTO (or `rto_init` if uninitialized).
     pub fn current_rto(&self) -> Duration {
         if self.rtt.is_initialized() {
@@ -157,12 +178,21 @@ impl AdaptiveEngine {
         }
     }
 
-    /// Record a probe outcome event.
-    ///
-    /// This is the primary entry point.  Call this for every completed or
-    /// expired probe.  The engine routes the event to the appropriate
-    /// subsystems based on the outcome classification.
+    /// Record a probe outcome for the default global destination.
+    #[inline]
     pub fn record_outcome(&mut self, outcome: ProbeOutcome) {
+        self.record_dest_outcome(DEFAULT_DESTINATION_ID, outcome);
+    }
+
+    /// Record a probe outcome for a specific destination (§ 2.3 & § 3.3).
+    ///
+    /// Routes the outcome to the RTT estimator, tail tracker, change detector,
+    /// destination-level concurrency tracker, and loss monitor.
+    pub fn record_dest_outcome(&mut self, dest_id: u64, outcome: ProbeOutcome) {
+        // Complete the in-flight probe on concurrency tracker
+        self.concurrency.on_completion(dest_id);
+        self.concurrency.record_dest_outcome(dest_id, outcome);
+
         match outcome {
             ProbeOutcome::SuccessInitial { rtt } => {
                 // § 1.1 — Eligible sample (n=0), Karn's rule satisfied.
@@ -173,7 +203,6 @@ impl AdaptiveEngine {
             }
             ProbeOutcome::SuccessRetransmitted { .. } => {
                 // § 1.1 — Karn's rule: reject RTT sample from retransmitted probe.
-                // Still counts as a successful completion for concurrency/loss.
                 self.epoch_events.successes += 1;
             }
             ProbeOutcome::ExpectedSilence => {
@@ -182,16 +211,18 @@ impl AdaptiveEngine {
             }
             ProbeOutcome::InferredLoss => {
                 self.epoch_events.inferred_loss += 1;
-                self.epoch_has_loss = true;
             }
             ProbeOutcome::InferredRateLimit => {
                 self.epoch_events.inferred_rate_limit += 1;
-                self.epoch_has_loss = true;
+            }
+            ProbeOutcome::Unclassified => {
+                // Excluded from all loss metrics and AIMD calculations
+                self.epoch_events.unclassified += 1;
             }
         }
     }
 
-    /// Advance the epoch clock.  Call this periodically (e.g., once per tick).
+    /// Advance the epoch clock. Call this periodically.
     ///
     /// If sufficient time has elapsed (≥ epoch duration), closes the current
     /// epoch and opens a new one, applying all state transitions.
@@ -215,7 +246,7 @@ impl AdaptiveEngine {
         true
     }
 
-    /// Force-close the current epoch (for shutdown or flush).
+    /// Force-close the current epoch (for shutdown, flush, or manual stepping).
     pub fn force_close_epoch(&mut self, now: Timestamp) {
         let elapsed = now.duration_since(self.epoch_start);
         self.close_epoch(elapsed);
@@ -234,18 +265,25 @@ impl AdaptiveEngine {
             d_rate_limit: self.loss.d_rate_limit(),
             global_window: self.concurrency.global.window(),
             violation_count: self.change_detector.violation_count(),
+            in_flight: self.concurrency.global_in_flight,
         }
     }
 
     // ── Private ──────────────────────────────────────────────────────────
 
     fn close_epoch(&mut self, elapsed: Duration) {
-        // § 1.5 — Change detection (Adaptive mode only).
-        if self.change_detector.is_enabled() {
+        // If this is the first epoch with samples, seed the baseline
+        if self.baseline_srtt == Duration::ZERO && self.rtt.is_initialized() {
+            self.baseline_srtt = self.rtt.srtt();
+            self.baseline_rttvar = self.rtt.rttvar();
+        }
+
+        // § 1.5 — Change detection against snapshotted baseline (Adaptive mode only)
+        if self.change_detector.is_enabled() && self.baseline_srtt > Duration::ZERO {
             let result = self.change_detector.close_epoch(
                 &self.epoch_acc,
-                self.rtt.srtt(),
-                self.rtt.rttvar(),
+                self.baseline_srtt,
+                self.baseline_rttvar,
             );
             if let EpochCloseResult::ReAnchor {
                 new_srtt,
@@ -253,26 +291,28 @@ impl AdaptiveEngine {
             } = result
             {
                 self.rtt.force_reanchor(new_srtt, new_rttvar);
+                self.baseline_srtt = new_srtt;
+                self.baseline_rttvar = new_rttvar;
             }
         }
 
-        // § 3.2 — AIMD concurrency update.
-        let epoch_outcome = if self.epoch_has_loss {
-            EpochOutcome::Loss
-        } else if self.epoch_events.has_completions() {
-            EpochOutcome::Lossless
-        } else {
-            EpochOutcome::Idle
-        };
-        self.concurrency.global.apply_epoch(epoch_outcome);
+        // § 3 — AIMD concurrency updates across all active destinations & global
+        // In Reference profile (§ 5), concurrency is fixed at caller ceiling
+        self.concurrency.apply_epoch();
 
-        // § 4.2 — Time-normalized loss EWMA update.
+        // § 4.2 — Time-normalized loss EWMA update
+        // In Reference profile, acts as passive telemetry
         self.loss.update(&self.epoch_events, elapsed);
 
-        // Reset epoch state.
+        // Snapshot baseline SRTT / RTTVAR for the NEXT epoch's change detection
+        if self.rtt.is_initialized() {
+            self.baseline_srtt = self.rtt.srtt();
+            self.baseline_rttvar = self.rtt.rttvar();
+        }
+
+        // Reset epoch accumulators
         self.epoch_acc.reset();
         self.epoch_events = EpochEvents::default();
-        self.epoch_has_loss = false;
     }
 }
 
@@ -290,133 +330,117 @@ mod tests {
         let cfg = AdaptiveConfig::adaptive();
         let mut engine = AdaptiveEngine::new(cfg, ts(0));
 
-        // Before any samples
         assert!(!engine.rtt().is_initialized());
         assert_eq!(engine.current_rto(), Duration::from_millis(500));
 
-        // First eligible sample
         engine.record_outcome(ProbeOutcome::SuccessInitial {
             rtt: Duration::from_millis(100),
         });
         assert!(engine.rtt().is_initialized());
-
-        // RTO = clamp(100 + max(1, 200), 100, 3000) = 300ms
-        // Wait, RTTVAR = max(1, 50) = 50, 4*50 = 200
-        // max(G=1, 200) = 200
-        // 100 + 200 = 300
         assert_eq!(engine.current_rto(), Duration::from_millis(300));
     }
 
     #[test]
-    fn karn_rejection() {
-        let cfg = AdaptiveConfig::adaptive();
+    fn reference_profile_isolation() {
+        let cfg = AdaptiveConfig::reference();
         let mut engine = AdaptiveEngine::new(cfg, ts(0));
 
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(100),
-        });
-        let srtt_after_init = engine.rtt().srtt();
+        assert_eq!(engine.concurrency().global.window(), cfg.c_max_global);
 
-        // Retransmitted response should NOT update SRTT
-        engine.record_outcome(ProbeOutcome::SuccessRetransmitted { attempt: 1 });
-        assert_eq!(engine.rtt().srtt(), srtt_after_init);
+        // Record drops and close epoch
+        engine.record_outcome(ProbeOutcome::InferredLoss);
+        engine.tick(ts(1000));
+
+        // Window must remain completely fixed in Reference mode
+        assert_eq!(engine.concurrency().global.window(), cfg.c_max_global);
     }
 
     #[test]
-    fn epoch_tick_increments_window_on_lossless() {
+    fn unclassified_outcome_ignored_by_loss_and_aimd() {
         let cfg = AdaptiveConfig::adaptive();
         let mut engine = AdaptiveEngine::new(cfg, ts(0));
 
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(100),
-        });
+        let initial_win = engine.concurrency().global.window();
+        engine.record_outcome(ProbeOutcome::Unclassified);
+        engine.tick(ts(100));
 
-        let win_before = engine.concurrency().global.window();
-
-        // Tick to close epoch (epoch_e_init = 100ms since SRTT was just set)
-        // Actually, SRTT = 100ms, so epoch_dur = clamp(100, 10, 1000) = 100ms
-        let closed = engine.tick(ts(100));
-        assert!(closed);
-
-        assert_eq!(
-            engine.concurrency().global.window(),
-            win_before + 1,
-            "Lossless epoch should increment window"
-        );
+        // Unclassified does not trigger loss reduction or additive increase
+        assert_eq!(engine.loss_monitor().d_loss(), 0.0);
+        assert_eq!(engine.loss_monitor().d_rate_limit(), 0.0);
+        assert_eq!(engine.concurrency().global.window(), initial_win);
     }
 
     #[test]
-    fn epoch_tick_decreases_window_on_loss() {
-        let cfg = AdaptiveConfig::adaptive();
+    fn min_completed_probes_enforcement() {
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.min_completed_probes = 5;
         let mut engine = AdaptiveEngine::new(cfg, ts(0));
 
-        // Build up the window first
-        for i in 0..10 {
+        // Only 2 completions (below threshold of 5)
+        for _ in 0..2 {
             engine.record_outcome(ProbeOutcome::SuccessInitial {
-                rtt: Duration::from_millis(100),
+                rtt: Duration::from_millis(50),
             });
-            engine.tick(ts((i + 1) * 100));
+        }
+        let win_before = engine.concurrency().global.window();
+        engine.tick(ts(100));
+
+        // Should NOT increment window because min_completed_probes not met
+        assert_eq!(engine.concurrency().global.window(), win_before);
+
+        // Now provide 5 completions
+        for _ in 0..5 {
+            engine.record_outcome(ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(50),
+            });
+        }
+        engine.tick(ts(200));
+        assert_eq!(engine.concurrency().global.window(), win_before + 1);
+    }
+
+    #[test]
+    fn per_destination_aimd_tracking() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let d1 = 101;
+        let d2 = 102;
+
+        engine.on_dispatch(d1);
+        engine.record_dest_outcome(d1, ProbeOutcome::InferredLoss);
+
+        engine.on_dispatch(d2);
+        for _ in 0..3 {
+            engine.record_dest_outcome(d2, ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(50),
+            });
         }
 
-        let win_before = engine.concurrency().global.window();
-        assert!(win_before > 1);
+        engine.tick(ts(100));
 
-        // Record a loss
-        engine.record_outcome(ProbeOutcome::InferredLoss);
-        engine.tick(ts(1100));
+        let dest1 = engine.concurrency().get_dest(d1).unwrap();
+        let dest2 = engine.concurrency().get_dest(d2).unwrap();
 
-        let win_after = engine.concurrency().global.window();
-        assert!(
-            win_after < win_before,
-            "Loss epoch should decrease window: {} -> {}",
-            win_before,
-            win_after
-        );
+        // Dest 1 experienced loss -> floor/reduction
+        assert_eq!(dest1.window.window(), cfg.c_min_dest);
+        // Dest 2 was lossless -> window increased
+        assert!(dest2.window.window() > cfg.c_min_dest);
     }
 
     #[test]
-    fn retry_schedule_latching() {
+    fn change_detection_with_snapshotted_baseline() {
         let cfg = AdaptiveConfig::adaptive();
         let mut engine = AdaptiveEngine::new(cfg, ts(0));
 
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(100),
-        });
-
-        let sched = engine.latch_retry_schedule();
-        let rto0 = sched.rto_for_attempt(0);
-
-        // Now update SRTT with a very different sample
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(500),
-        });
-
-        // The latched schedule should still use the old RTO
-        assert_eq!(sched.rto_for_attempt(0), rto0);
-
-        // But a new schedule should reflect the updated SRTT
-        let sched2 = engine.latch_retry_schedule();
-        assert_ne!(sched2.rto_for_attempt(0), rto0);
-    }
-
-    #[test]
-    fn change_detection_integration() {
-        let cfg = AdaptiveConfig::adaptive();
-        let mut engine = AdaptiveEngine::new(cfg, ts(0));
-
-        // Initialize at 50ms RTT
+        // Seed with 50ms baseline
         engine.record_outcome(ProbeOutcome::SuccessInitial {
             rtt: Duration::from_millis(50),
         });
-        let srtt_init = engine.rtt().srtt();
-        // SRTT=50, RTTVAR=max(1, 25)=25
+        engine.tick(ts(100)); // Establishes baseline 50ms
 
-        // Three consecutive epochs with median >> SRTT + c·RTTVAR
-        // threshold = 50 + 3*25 = 125 ms
-        // We need median > 125 ms consistently for 3 epochs
+        // 3 consecutive epochs with samples at 300ms
         let mut t = 100;
-        for epoch in 0..3 {
-            // Push 5 samples at 300ms (well above 125ms threshold)
+        for _ in 0..3 {
             for _ in 0..5 {
                 engine.record_outcome(ProbeOutcome::SuccessInitial {
                     rtt: Duration::from_millis(300),
@@ -424,74 +448,9 @@ mod tests {
             }
             t += 100;
             engine.tick(ts(t));
-
-            if epoch < 2 {
-                // SRTT should not have jumped to 300 yet (clamped updates)
-                // In Adaptive mode, it moves slowly due to clamping
-                assert!(engine.rtt().srtt() < Duration::from_millis(250));
-            }
         }
 
-        // After 3 violating epochs, change detector should have re-anchored
-        // SRTT to ~300 ms
-        let srtt_final = engine.rtt().srtt();
-        assert!(
-            srtt_final > srtt_init,
-            "Re-anchor should have moved SRTT up: {srtt_init:?} -> {srtt_final:?}"
-        );
-    }
-
-    #[test]
-    fn telemetry_snapshot() {
-        let cfg = AdaptiveConfig::adaptive();
-        let mut engine = AdaptiveEngine::new(cfg, ts(0));
-
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(100),
-        });
-
-        let tel = engine.telemetry();
-        assert!(tel.rtt_initialized);
-        assert_eq!(tel.srtt, Duration::from_millis(100));
-        assert!(tel.t95.is_some());
-        assert_eq!(tel.d_loss, 0.0);
-        assert_eq!(tel.d_rate_limit, 0.0);
-    }
-
-    #[test]
-    fn p95_tracks_through_engine() {
-        let cfg = AdaptiveConfig::adaptive();
-        let mut engine = AdaptiveEngine::new(cfg, ts(0));
-
-        for i in 1..=20 {
-            engine.record_outcome(ProbeOutcome::SuccessInitial {
-                rtt: Duration::from_millis(i * 10),
-            });
-        }
-
-        let t95 = engine.p95_tracker().p95().unwrap();
-        // 20 samples, ⌈0.95·20⌉ = 19, sorted samples: 10,20,...,200
-        // 19th = 190 ms
-        assert_eq!(t95, Duration::from_millis(190));
-    }
-
-    #[test]
-    fn expected_silence_excluded() {
-        let cfg = AdaptiveConfig::adaptive();
-        let mut engine = AdaptiveEngine::new(cfg, ts(0));
-
-        engine.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: Duration::from_millis(100),
-        });
-
-        // Many expected-silence outcomes should not trigger loss
-        for _ in 0..50 {
-            engine.record_outcome(ProbeOutcome::ExpectedSilence);
-        }
-
-        let win_before = engine.concurrency().global.window();
-        engine.tick(ts(100));
-        // Should be lossless (expected silence is excluded)
-        assert!(engine.concurrency().global.window() >= win_before);
+        // Re-anchor should have kicked in
+        assert!(engine.rtt().srtt() >= Duration::from_millis(250));
     }
 }

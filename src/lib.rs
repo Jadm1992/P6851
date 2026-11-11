@@ -10,7 +10,11 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+
 pub mod config;
+pub mod math;
 pub mod rtt;
 pub mod p95;
 pub mod change_detector;
@@ -24,6 +28,6 @@ pub use rtt::RttEstimator;
 pub use p95::RollingP95;
 pub use change_detector::ChangeDetector;
 pub use rto::ProbeRetrySchedule;
-pub use concurrency::{AimdWindow, ConcurrencyController};
+pub use concurrency::{AimdWindow, ConcurrencyController, DestinationTracker};
 pub use loss::LossMonitor;
-pub use engine::AdaptiveEngine;
+pub use engine::{AdaptiveEngine, TelemetrySnapshot, Timestamp};

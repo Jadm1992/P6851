@@ -5,6 +5,11 @@
 
 use core::time::Duration;
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
+
 /// Rolling-window P95 tail tracker.
 ///
 /// Maintains a ring buffer of the last `W` eligible RTT samples and computes

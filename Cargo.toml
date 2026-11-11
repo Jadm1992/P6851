@@ -6,7 +6,8 @@ description = "RFC 6298 adaptive RTT estimation, RTO computation, AIMD concurren
 
 [features]
 default = ["std"]
-std = []
+std = ["alloc"]
+alloc = []
 
 [dev-dependencies]
 proptest = "1"
