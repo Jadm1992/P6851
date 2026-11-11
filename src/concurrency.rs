@@ -4,6 +4,8 @@
 //! multiplicative-decrease state transitions, dual-ceiling enforcement,
 //! and destination-level AIMD integration.
 
+use core::time::Duration;
+
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
@@ -39,13 +41,22 @@ pub enum EpochOutcome {
 }
 
 impl AimdWindow {
-    /// Create a new AIMD window.
+    /// Create a new AIMD window with validated bounds.
+    ///
+    /// Guarantees:
+    /// - `c_min ≥ 1` (never zero-sized window)
+    /// - `c_max ≥ c_min` (prevents clamp panics)
+    /// - `initial` safely clamped to `[c_min, c_max]`
+    /// - `delta` clamped to `(0.0, 1.0]`
     pub fn new(initial: usize, c_min: usize, c_max: usize, delta: f64) -> Self {
+        let safe_min = c_min.max(1);
+        let safe_max = c_max.max(safe_min);
+        let safe_delta = delta.clamp(0.01, 1.0);
         Self {
-            window: initial.clamp(c_min, c_max),
-            c_min: c_min.max(1),
-            c_max,
-            delta,
+            window: initial.clamp(safe_min, safe_max),
+            c_min: safe_min,
+            c_max: safe_max,
+            delta: safe_delta,
         }
     }
 
@@ -63,13 +74,15 @@ impl AimdWindow {
 
     /// Apply an epoch state transition with configured policy.
     ///
-    /// - **Lossless**: C_new = min(C_max, C_old + 1)
+    /// - **Lossless**: C_new = min(C_max, C_old.saturating_add(1))
     /// - **Loss / RateLimit**: C_new = max(C_min, ⌊C_old · δ_eff⌋)
+    /// - **LossAndRateLimit**: uses conservative `delta.min(rate_limit_delta)`
+    ///   to alleviate both conditions while preserving at most one multiplicative decrease per epoch.
     /// - **Idle**: C_new = C_old (no change)
     pub fn apply_epoch(&mut self, outcome: EpochOutcome, policy: AimdLossPolicy) {
         match outcome {
             EpochOutcome::Lossless => {
-                self.window = (self.window + 1).min(self.c_max);
+                self.window = self.window.saturating_add(1).min(self.c_max);
             }
             EpochOutcome::Loss => {
                 let reduced = (self.window as f64 * self.delta) as usize;
@@ -89,7 +102,17 @@ impl AimdWindow {
                 }
             }
             EpochOutcome::LossAndRateLimit => {
-                let reduced = (self.window as f64 * self.delta) as usize;
+                let eff_delta = match policy {
+                    AimdLossPolicy::Shared => self.delta,
+                    AimdLossPolicy::SeparateRateLimit { rate_limit_delta } => {
+                        // Apply the more conservative (smaller) multiplier to alleviate
+                        // both loss and rate limiting while enforcing at most one multiplicative
+                        // decrease in this epoch.
+                        self.delta.min(rate_limit_delta)
+                    }
+                    AimdLossPolicy::LossOnly => self.delta,
+                };
+                let reduced = (self.window as f64 * eff_delta) as usize;
                 self.window = reduced.max(self.c_min);
             }
             EpochOutcome::Idle => {
@@ -124,9 +147,11 @@ pub struct DestinationTracker {
 
 impl DestinationTracker {
     pub fn new(id: u64, c_min: usize, c_max: usize, delta: f64) -> Self {
+        let safe_min = c_min.max(1);
+        let safe_max = c_max.max(safe_min);
         Self {
             id,
-            window: AimdWindow::new(c_min, c_min, c_max, delta),
+            window: AimdWindow::new(safe_min, safe_min, safe_max, delta),
             in_flight: 0,
             events: EpochEvents::default(),
             consecutive_backoffs: 0,
@@ -137,13 +162,55 @@ impl DestinationTracker {
     /// Record a probe dispatch to this destination.
     #[inline]
     pub fn on_dispatch(&mut self) {
-        self.in_flight += 1;
+        self.in_flight = self.in_flight.saturating_add(1);
+    }
+
+    /// Attempt to record a probe completion/expiration from this destination.
+    ///
+    /// Returns `true` if an active in-flight probe was decremented, or `false`
+    /// if there were no outstanding in-flight probes (e.g. mismatched/duplicate completion).
+    #[inline]
+    pub fn try_complete(&mut self) -> bool {
+        if self.in_flight > 0 {
+            self.in_flight -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     /// Record a probe completion/expiration from this destination.
     #[inline]
     pub fn on_completion(&mut self) {
-        self.in_flight = self.in_flight.saturating_sub(1);
+        self.try_complete();
+    }
+
+    /// Destination-level timeout multiplier (§ 2.3).
+    ///
+    /// Computes gamma^k where k is the number of consecutive backed-off losses
+    /// on this destination, capped at 64 to prevent float exponent overflow.
+    pub fn backoff_multiplier(&self, gamma: f64) -> f64 {
+        if self.consecutive_backoffs == 0 {
+            1.0
+        } else {
+            crate::math::pow_f64_u32(gamma, self.consecutive_backoffs.min(64))
+        }
+    }
+
+    /// Calculate the backed-off base RTO for this destination given base RTO (§ 2.3).
+    ///
+    /// Cleared and reset to fresh RTO_0 upon receiving an eligible (n=0) ACK.
+    pub fn backed_off_rto(&self, base_rto: Duration, rto_max: Duration, gamma: f64) -> Duration {
+        if self.consecutive_backoffs == 0 {
+            base_rto
+        } else {
+            let factor = self.backoff_multiplier(gamma);
+            if factor.is_infinite() {
+                rto_max
+            } else {
+                base_rto.mul_f64(factor).min(rto_max)
+            }
+        }
     }
 
     /// Record an outcome for this destination (§ 2.3 Karn reset semantics included).
@@ -198,24 +265,30 @@ pub struct ConcurrencyController {
 }
 
 impl ConcurrencyController {
-    /// Create from config.
+    /// Create from config with validated bounds.
     pub fn new(cfg: &AdaptiveConfig) -> Self {
+        let safe_min_global = cfg.c_min_global.max(1);
+        let safe_max_global = cfg.c_max_global.max(safe_min_global);
+        let safe_min_dest = cfg.c_min_dest.max(1);
+        let safe_max_dest = cfg.c_max_dest.max(safe_min_dest);
+        let safe_min_completed = cfg.min_completed_probes.max(1);
+
         let initial_global = if cfg.mode == ProfileMode::Reference {
-            cfg.c_max_global
+            safe_max_global
         } else {
-            cfg.c_min_global
+            safe_min_global
         };
         let initial_dest = if cfg.mode == ProfileMode::Reference {
-            cfg.c_max_dest
+            safe_max_dest
         } else {
-            cfg.c_min_dest
+            safe_min_dest
         };
 
         Self {
             global: AimdWindow::new(
                 initial_global,
-                cfg.c_min_global,
-                cfg.c_max_global,
+                safe_min_global,
+                safe_max_global,
                 cfg.aimd_delta,
             ),
             global_in_flight: 0,
@@ -223,9 +296,9 @@ impl ConcurrencyController {
             mode: cfg.mode,
             dest_delta: cfg.aimd_delta,
             dest_c_min: initial_dest,
-            dest_c_max: cfg.c_max_dest,
+            dest_c_max: safe_max_dest,
             loss_policy: cfg.aimd_loss_policy,
-            min_completed_probes: cfg.min_completed_probes,
+            min_completed_probes: safe_min_completed,
         }
     }
 
@@ -249,6 +322,22 @@ impl ConcurrencyController {
         self.destinations.iter().find(|d| d.id == dest_id)
     }
 
+    /// Get the destination-backed-off RTO for a specific destination (§ 2.3).
+    ///
+    /// Applies the destination's latched consecutive backoff multiplier to `base_rto`.
+    pub fn dest_backed_off_rto(
+        &self,
+        dest_id: u64,
+        base_rto: Duration,
+        rto_max: Duration,
+        gamma: f64,
+    ) -> Duration {
+        match self.get_dest(dest_id) {
+            Some(d) => d.backed_off_rto(base_rto, rto_max, gamma),
+            None => base_rto,
+        }
+    }
+
     /// Dual ceiling check (§ 3.3):
     ///
     /// in_flight_d < C_d  AND  Σ in_flight_d < C_global.
@@ -265,17 +354,33 @@ impl ConcurrencyController {
 
     /// Record a probe dispatch to destination `dest_id`.
     pub fn on_dispatch(&mut self, dest_id: u64) {
-        self.global_in_flight += 1;
+        self.global_in_flight = self.global_in_flight.saturating_add(1);
         let dest = self.get_or_create_dest(dest_id);
         dest.on_dispatch();
     }
 
-    /// Record a probe completion/expiration for destination `dest_id`.
-    pub fn on_completion(&mut self, dest_id: u64) {
-        self.global_in_flight = self.global_in_flight.saturating_sub(1);
-        if let Some(dest) = self.destinations.iter_mut().find(|d| d.id == dest_id) {
-            dest.on_completion();
+    /// Attempt to complete a probe for destination `dest_id`.
+    ///
+    /// Only decrements the global in-flight counter if a matching destination exists
+    /// and had an active in-flight probe. Returns `true` on successful completion,
+    /// or `false` on duplicate/mismatched completion.
+    pub fn try_complete(&mut self, dest_id: u64) -> bool {
+        if let Some(dest) = self.destinations.iter_mut().find(|d| d.id == dest_id)
+            && dest.try_complete()
+        {
+            self.global_in_flight = self.global_in_flight.saturating_sub(1);
+            return true;
         }
+        false
+    }
+
+    /// Record a probe completion/expiration for destination `dest_id`.
+    ///
+    /// Ensures global in-flight counters are only decremented when an actual
+    /// in-flight probe completes.
+    #[inline]
+    pub fn on_completion(&mut self, dest_id: u64) {
+        self.try_complete(dest_id);
     }
 
     /// Record an outcome for destination `dest_id`.
@@ -300,7 +405,7 @@ impl ConcurrencyController {
 
         let mut global_has_loss = false;
         let mut global_has_rate_limit = false;
-        let mut global_completions = 0;
+        let mut global_completions: usize = 0;
 
         // Apply per-destination transitions
         for dest in &mut self.destinations {
@@ -314,7 +419,7 @@ impl ConcurrencyController {
             if has_rate {
                 global_has_rate_limit = true;
             }
-            global_completions += completions;
+            global_completions = global_completions.saturating_add(completions);
 
             let dest_outcome = if has_loss && has_rate {
                 EpochOutcome::LossAndRateLimit
@@ -322,7 +427,7 @@ impl ConcurrencyController {
                 EpochOutcome::Loss
             } else if has_rate {
                 EpochOutcome::RateLimit
-            } else if completions >= self.min_completed_probes {
+            } else if completions >= self.min_completed_probes && completions > 0 {
                 EpochOutcome::Lossless
             } else {
                 EpochOutcome::Idle
@@ -339,7 +444,7 @@ impl ConcurrencyController {
             EpochOutcome::Loss
         } else if global_has_rate_limit {
             EpochOutcome::RateLimit
-        } else if global_completions >= self.min_completed_probes {
+        } else if global_completions >= self.min_completed_probes && global_completions > 0 {
             EpochOutcome::Lossless
         } else {
             EpochOutcome::Idle
@@ -401,6 +506,102 @@ mod tests {
     }
 
     #[test]
+    fn loss_and_rate_limit_precedence_separate_rate_limit() {
+        let mut w = AimdWindow::new(20, 1, 100, 0.5);
+        let policy = AimdLossPolicy::SeparateRateLimit {
+            rate_limit_delta: 0.8,
+        };
+        // Both loss (0.5) and rate limit (0.8) occurred in the same epoch.
+        // Precedence applies the more conservative multiplier: min(0.5, 0.8) = 0.5 -> window = 10
+        w.apply_epoch(EpochOutcome::LossAndRateLimit, policy);
+        assert_eq!(w.window(), 10);
+
+        let mut w2 = AimdWindow::new(20, 1, 100, 0.5);
+        let stricter_rate_policy = AimdLossPolicy::SeparateRateLimit {
+            rate_limit_delta: 0.3,
+        };
+        // Stricter rate limit (0.3) vs loss (0.5) -> min(0.5, 0.3) = 0.3 -> window = 6
+        w2.apply_epoch(EpochOutcome::LossAndRateLimit, stricter_rate_policy);
+        assert_eq!(w2.window(), 6);
+    }
+
+    #[test]
+    fn try_complete_guards_against_mismatched_completions() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut ctrl = ConcurrencyController::new(&cfg);
+        let dest_id = 42;
+
+        ctrl.on_dispatch(dest_id);
+        assert_eq!(ctrl.global_in_flight, 1);
+        assert_eq!(ctrl.get_dest(dest_id).unwrap().in_flight, 1);
+
+        // Mismatched completion for a nonexistent destination
+        assert!(!ctrl.try_complete(999));
+        assert_eq!(ctrl.global_in_flight, 1, "Global in-flight must not decrement for nonexistent dest");
+
+        // Valid completion
+        assert!(ctrl.try_complete(dest_id));
+        assert_eq!(ctrl.global_in_flight, 0);
+
+        // Duplicate completion for the same destination (now at 0)
+        assert!(!ctrl.try_complete(dest_id));
+        assert_eq!(ctrl.global_in_flight, 0, "Global in-flight must not underflow or decrement on duplicate completion");
+    }
+
+    #[test]
+    fn edge_cases_construction_sanitization() {
+        // c_min = 0, c_min > c_max, min_completed = 0
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.c_min_global = 0;
+        cfg.c_max_global = 0;
+        cfg.c_min_dest = 50;
+        cfg.c_max_dest = 10; // c_min > c_max
+        cfg.min_completed_probes = 0;
+
+        let ctrl = ConcurrencyController::new(&cfg);
+        // c_min_global should be sanitized to at least 1
+        assert!(ctrl.global.c_min >= 1);
+        assert!(ctrl.global.c_max >= ctrl.global.c_min);
+        // dest c_max should be clamped to at least dest c_min
+        assert!(ctrl.dest_c_max >= ctrl.dest_c_min);
+        assert!(ctrl.min_completed_probes >= 1);
+    }
+
+    #[test]
+    fn destination_backed_off_rto_calculation() {
+        let mut tracker = DestinationTracker::new(1, 1, 10, 0.5);
+        let base_rto = Duration::from_millis(100);
+        let rto_max = Duration::from_secs(3);
+        let gamma = 1.5;
+
+        // No backoffs -> base RTO
+        assert_eq!(tracker.backed_off_rto(base_rto, rto_max, gamma), base_rto);
+
+        // One loss -> 100 * 1.5 = 150ms
+        tracker.record_outcome(ProbeOutcome::InferredLoss);
+        assert_eq!(tracker.consecutive_backoffs, 1);
+        assert_eq!(
+            tracker.backed_off_rto(base_rto, rto_max, gamma),
+            Duration::from_millis(150)
+        );
+
+        // Second loss -> 100 * 2.25 = 225ms
+        tracker.record_outcome(ProbeOutcome::InferredLoss);
+        assert_eq!(tracker.consecutive_backoffs, 2);
+        assert_eq!(
+            tracker.backed_off_rto(base_rto, rto_max, gamma),
+            Duration::from_millis(225)
+        );
+
+        // Success initial resets backoff -> back to 100ms
+        tracker.record_outcome(ProbeOutcome::SuccessInitial {
+            rtt: Duration::from_millis(50),
+        });
+        assert_eq!(tracker.consecutive_backoffs, 0);
+        assert_eq!(tracker.backed_off_rto(base_rto, rto_max, gamma), base_rto);
+    }
+
+    #[test]
     fn dual_ceiling_controller() {
         let cfg = AdaptiveConfig::adaptive();
         let mut ctrl = ConcurrencyController::new(&cfg);
@@ -434,7 +635,7 @@ mod tests {
 
         // Eligible n=0 response resets backoff
         tracker.record_outcome(ProbeOutcome::SuccessInitial {
-            rtt: core::time::Duration::from_millis(50),
+            rtt: Duration::from_millis(50),
         });
         assert_eq!(tracker.consecutive_backoffs, 0);
     }
