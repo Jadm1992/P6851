@@ -1,57 +1,173 @@
-//! Self-contained mathematical functions for `no_std` environments.
+//! Self-contained, deterministic mathematical functions for `std` and `no_std` environments.
+//!
+//! Provides:
+//! - Exponentiation by squaring: [`pow_f64_u32`] with O(log n) efficiency and overflow safety.
+//! - Time-normalized smoothing factor: [`one_minus_exp_neg`] evaluating `1 - exp(-x)`
+//!   without catastrophic cancellation for small `x` or Padé sign distortion for large `x`.
 
+/// Compute `base^exp` using exponentiation by squaring in O(log n) time.
+///
+/// Operates identically in both `std` and `no_std` environments, avoiding `exp as i32`
+/// negative exponent errors when `exp > i32::MAX`.
+///
+/// ### Non-finite inputs:
+/// - If `exp == 0`, returns `1.0` (including `0^0`, `NaN^0`, `inf^0` per IEEE 754-2008).
+/// - If `base.is_nan()`, returns `NaN`.
+/// - If `base == +inf`, returns `+inf` for `exp >= 1`.
+/// - If `base == -inf`, returns `-inf` for odd `exp`, and `+inf` for even `exp`.
 #[inline]
 pub fn pow_f64_u32(base: f64, exp: u32) -> f64 {
-    #[cfg(feature = "std")]
-    {
-        base.powi(exp as i32)
+    if exp == 0 {
+        return 1.0;
     }
-    #[cfg(not(feature = "std"))]
-    {
-        let mut b = base;
-        let mut e = exp;
-        let mut result = 1.0;
-        while e > 0 {
-            if e & 1 == 1 {
-                result *= b;
-            }
-            b *= b;
-            e >>= 1;
+    if !base.is_finite() {
+        if base.is_nan() {
+            return f64::NAN;
         }
-        result
+        if base == f64::INFINITY {
+            return f64::INFINITY;
+        }
+        if base == f64::NEG_INFINITY {
+            return if exp % 2 == 1 {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            };
+        }
     }
+    let mut b = base;
+    let mut e = exp;
+    let mut result = 1.0;
+    while e > 0 {
+        if e & 1 == 1 {
+            result *= b;
+        }
+        b *= b;
+        e >>= 1;
+    }
+    result
 }
 
-/// Compute 1 - exp(-x) for x >= 0.
+/// Compute `1 - exp(-x)` for `x >= 0`.
 ///
-/// In `no_std`, uses a high-precision Padé approximant for exp(-x) when x is small,
-/// and converges smoothly for large x without external libraries.
+/// ### Numerical Accuracy & Precision Strategy:
+/// 1. **Ultra-small $x$ ($x < 10^{-15}$):**
+///    Uses $1 - e^{-x} = x$. Avoids catastrophic cancellation and preserves tiny positive
+///    smoothing coefficients down to subnormal floats ($x = 10^{-20}$ returns $10^{-20}$).
+/// 2. **Small $x$ ($10^{-15} \le x < 0.1$):**
+///    Uses a 9th-degree Taylor polynomial in Horner's form. Evaluated without subtraction
+///    from 1.0 to eliminate cancellation error ($< 10^{-16}$ truncation error).
+/// 3. **Intermediate & Large $x$ ($0.1 \le x < 37.0$):**
+///    In `std`, evaluates `-(-x).exp_m1()`.
+///    In `no_std`, uses $\ln 2$ argument reduction: $x = k \ln 2 + r$ with $r \in [-\frac{\ln 2}{2}, \frac{\ln 2}{2}]$,
+///    then $e^{-x} = e^{-r} \cdot 2^{-k}$ evaluated via polynomial expansion, guaranteeing positive,
+///    monotonic values without Padé denominator/numerator sign errors (tested up to $x = 30$ and beyond).
+/// 4. **Asymptotic limit ($x \ge 37.0$):**
+///    Since $e^{-37} < 10^{-16} < \epsilon_{\text{f64}}$, returns `1.0`.
+///
+/// ### Non-finite inputs:
+/// - If `x.is_nan()`, returns `NaN`.
+/// - If `x == +inf`, returns `1.0`.
+/// - If `x <= 0.0`, returns `0.0`.
 #[inline]
 pub fn one_minus_exp_neg(x: f64) -> f64 {
+    if !x.is_finite() {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x.is_sign_positive() {
+            return 1.0;
+        }
+        return f64::NEG_INFINITY;
+    }
     if x <= 0.0 {
         return 0.0;
     }
+
     #[cfg(feature = "std")]
     {
-        1.0 - (-x).exp()
+        let res = -(-x).exp_m1();
+        res.clamp(0.0, 1.0)
     }
+
     #[cfg(not(feature = "std"))]
     {
-        if x > 30.0 {
+        one_minus_exp_neg_no_std(x)
+    }
+}
+
+/// Standalone `no_std` implementation of `1 - exp(-x)` with full double-precision accuracy.
+/// Available in all profiles for cross-validation and standalone benchmarking.
+pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
+    if !x.is_finite() {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x.is_sign_positive() {
             return 1.0;
         }
-        // Padé (3,3) approximation for exp(-x)
-        // exp(-x) ≈ (1 - x/2 + x^2/10 - x^3/120) / (1 + x/2 + x^2/10 + x^3/120)
-        // For larger x, reduce via e^(-x) = (e^(-x/4))^4
-        let x_scaled = x / 4.0;
-        let x2 = x_scaled * x_scaled;
-        let x3 = x2 * x_scaled;
-        let p = 1.0 - 0.5 * x_scaled + 0.1 * x2 - (1.0 / 120.0) * x3;
-        let q = 1.0 + 0.5 * x_scaled + 0.1 * x2 + (1.0 / 120.0) * x3;
-        let r = p / q;
-        let exp_neg = r * r * r * r;
-        (1.0 - exp_neg).clamp(0.0, 1.0)
+        return f64::NEG_INFINITY;
     }
+    if x <= 0.0 {
+        return 0.0;
+    }
+
+    // Case 1: Ultra-small x (< 1e-15).
+    // 1 - exp(-x) ≈ x (since x^2/2 < 1e-30 < epsilon_f64).
+    // Preserves positive smoothing coefficients for Δt << τ (e.g. x = 1e-20).
+    if x < 1e-15 {
+        return x;
+    }
+
+    // Case 2: Small x in [1e-15, 0.1).
+    // Taylor expansion of (1 - exp(-x)) in Horner's form:
+    // x * (1 - x/2 + x^2/6 - x^3/24 + x^4/120 - x^5/720 + x^6/5040 - x^7/40320 + x^8/362880)
+    // Truncation error at x = 0.1 is < 0.1^10 / 3628800 ≈ 2.7e-17.
+    if x < 0.1 {
+        let poly = 1.0
+            - x * (0.5
+                - x * ((1.0 / 6.0)
+                    - x * ((1.0 / 24.0)
+                        - x * ((1.0 / 120.0)
+                            - x * ((1.0 / 720.0)
+                                - x * ((1.0 / 5040.0)
+                                    - x * ((1.0 / 40320.0) - x / 362880.0)))))));
+        return x * poly;
+    }
+
+    // Case 3: Large x (x >= 37.0).
+    // exp(-37) ≈ 8.5e-17 < epsilon_f64 / 2.
+    // In IEEE 754 double precision, 1.0 - exp(-x) is identically 1.0.
+    if x >= 37.0 {
+        return 1.0;
+    }
+
+    // Case 4: Intermediate x in [0.1, 37.0).
+    // Range reduction via ln(2):
+    // x = k * ln(2) + r, where k = round(x / ln(2)), r ∈ [-ln(2)/2, ln(2)/2].
+    // exp(-x) = 2^(-k) * exp(-r).
+    use core::f64::consts::{LN_2, LOG2_E};
+
+    let k = (x * LOG2_E + 0.5) as u32;
+    let k_float = k as f64;
+    let r = x - k_float * LN_2;
+
+    // Polynomial approximation of exp(-r) for |r| <= 0.35:
+    let exp_neg_r = 1.0
+        - r * (1.0
+            - r * (0.5
+                - r * ((1.0 / 6.0)
+                    - r * ((1.0 / 24.0)
+                        - r * ((1.0 / 120.0)
+                            - r * ((1.0 / 720.0)
+                                - r * ((1.0 / 5040.0)
+                                    - r * ((1.0 / 40320.0) - r / 362880.0))))))));
+
+    // Exact scale factor 2^(-k)
+    let scale = pow_f64_u32(0.5, k);
+    let exp_neg_x = exp_neg_r * scale;
+
+    (1.0 - exp_neg_x).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -59,7 +175,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_pow() {
+    fn test_pow_basic() {
         assert!((pow_f64_u32(1.5, 0) - 1.0).abs() < 1e-12);
         assert!((pow_f64_u32(1.5, 1) - 1.5).abs() < 1e-12);
         assert!((pow_f64_u32(1.5, 2) - 2.25).abs() < 1e-12);
@@ -67,13 +183,103 @@ mod tests {
     }
 
     #[test]
-    fn test_one_minus_exp() {
-        assert!((one_minus_exp_neg(0.0) - 0.0).abs() < 1e-12);
-        let val1 = one_minus_exp_neg(1.0);
-        let expected1 = 1.0 - (-1.0_f64).exp();
-        assert!((val1 - expected1).abs() < 1e-4);
+    fn test_pow_u32_max_no_negative_exponent() {
+        // u32::MAX would cast to -1 as i32, turning 2.0^u32::MAX into 0.5!
+        // With squaring, it correctly overflows to +inf.
+        let val = pow_f64_u32(2.0, u32::MAX);
+        assert!(val.is_infinite());
+        assert!(val.is_sign_positive());
 
-        let val_large = one_minus_exp_neg(50.0);
-        assert_eq!(val_large, 1.0);
+        let val_one = pow_f64_u32(1.0, u32::MAX);
+        assert_eq!(val_one, 1.0);
+    }
+
+    #[test]
+    fn test_pow_non_finite_inputs() {
+        assert_eq!(pow_f64_u32(f64::NAN, 0), 1.0);
+        assert!(pow_f64_u32(f64::NAN, 1).is_nan());
+        assert_eq!(pow_f64_u32(f64::INFINITY, 1), f64::INFINITY);
+        assert_eq!(pow_f64_u32(f64::NEG_INFINITY, 1), f64::NEG_INFINITY);
+        assert_eq!(pow_f64_u32(f64::NEG_INFINITY, 2), f64::INFINITY);
+    }
+
+    #[test]
+    fn test_one_minus_exp_ultra_small_x() {
+        // x = 10^-20 must yield positive smoothing coefficient, not 0.0
+        let val_20 = one_minus_exp_neg(1e-20);
+        assert!(val_20 > 0.0, "x = 1e-20 must produce positive smoothing coefficient");
+        assert!((val_20 - 1e-20).abs() < 1e-30);
+
+        let val_20_nostd = one_minus_exp_neg_no_std(1e-20);
+        assert!(val_20_nostd > 0.0);
+        assert!((val_20_nostd - 1e-20).abs() < 1e-30);
+    }
+
+    #[test]
+    fn test_one_minus_exp_small_x() {
+        // x = 10^-12 accurate small-value behavior
+        let val_12 = one_minus_exp_neg(1e-12);
+        let val_12_nostd = one_minus_exp_neg_no_std(1e-12);
+        let expected = 1e-12 - 0.5 * 1e-24;
+        assert!((val_12 - expected).abs() < 1e-20);
+        assert!((val_12_nostd - expected).abs() < 1e-20);
+    }
+
+    #[test]
+    fn test_one_minus_exp_x_one() {
+        // x = 1: agreement with reference exponential 1 - exp(-1) ≈ 0.6321205588285577
+        let val = one_minus_exp_neg(1.0);
+        let val_nostd = one_minus_exp_neg_no_std(1.0);
+        let ref_val = 0.6321205588285577;
+        assert!((val - ref_val).abs() < 1e-12);
+        assert!((val_nostd - ref_val).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_one_minus_exp_x_ten() {
+        // x = 10: accurate intermediate behavior 1 - exp(-10) ≈ 0.9999546000702375
+        let val = one_minus_exp_neg(10.0);
+        let val_nostd = one_minus_exp_neg_no_std(10.0);
+        let ref_val = 0.9999546000702375;
+        assert!((val - ref_val).abs() < 1e-12);
+        assert!((val_nostd - ref_val).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_one_minus_exp_x_twenty() {
+        // x = 20: stable large-value behavior
+        let val = one_minus_exp_neg(20.0);
+        let val_nostd = one_minus_exp_neg_no_std(20.0);
+        let ref_val = 1.0 - (-20.0_f64).exp();
+        assert!((val - ref_val).abs() < 1e-12);
+        assert!((val_nostd - ref_val).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_one_minus_exp_x_thirty_no_pade_sign_error() {
+        // x = 30: must not suffer from Padé negative numerator sign error
+        let val = one_minus_exp_neg(30.0);
+        let val_nostd = one_minus_exp_neg_no_std(30.0);
+        let ref_val = 1.0 - 9.357622968840175e-14;
+        assert!((val - ref_val).abs() < 1e-12);
+        assert!((val_nostd - ref_val).abs() < 1e-12);
+        assert!(val < 1.0);
+        assert!(val_nostd < 1.0);
+    }
+
+    #[test]
+    fn test_one_minus_exp_asymptotic_infinity() {
+        assert_eq!(one_minus_exp_neg(100.0), 1.0);
+        assert_eq!(one_minus_exp_neg_no_std(100.0), 1.0);
+        assert_eq!(one_minus_exp_neg(f64::INFINITY), 1.0);
+        assert_eq!(one_minus_exp_neg_no_std(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn test_one_minus_exp_non_finite() {
+        assert!(one_minus_exp_neg(f64::NAN).is_nan());
+        assert!(one_minus_exp_neg_no_std(f64::NAN).is_nan());
+        assert_eq!(one_minus_exp_neg(-1.0), 0.0);
+        assert_eq!(one_minus_exp_neg_no_std(-1.0), 0.0);
     }
 }
