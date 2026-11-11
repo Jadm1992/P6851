@@ -96,6 +96,12 @@ pub enum ConfigError {
     InvalidRttvarMin { mode: ProfileMode, min: Duration },
     /// `p95_window_size` must be in `[64, 128]` (§ 1.4).
     InvalidP95WindowSize(usize),
+    /// Reference profile requires `rto_min >= 1s` per RFC 6298 § 2.4.
+    InvalidReferenceRtoMin(Duration),
+    /// Reference profile requires `rto_init >= 1s` per RFC 6298 § 2.1.
+    InvalidReferenceRtoInit(Duration),
+    /// Reference profile requires `rto_max >= 60s` per RFC 6298 § 2.5.
+    InvalidReferenceRtoMax(Duration),
 }
 
 impl core::fmt::Display for ConfigError {
@@ -167,6 +173,15 @@ impl core::fmt::Display for ConfigError {
             ),
             Self::InvalidP95WindowSize(w) => {
                 write!(f, "p95_window_size must be in [64, 128], got {w}")
+            }
+            Self::InvalidReferenceRtoMin(min) => {
+                write!(f, "Reference profile requires rto_min >= 1s per RFC 6298 § 2.4, got {min:?}")
+            }
+            Self::InvalidReferenceRtoInit(init) => {
+                write!(f, "Reference profile requires rto_init >= 1s per RFC 6298 § 2.1, got {init:?}")
+            }
+            Self::InvalidReferenceRtoMax(max) => {
+                write!(f, "Reference profile requires rto_max >= 60s per RFC 6298 § 2.5, got {max:?}")
             }
         }
     }
@@ -383,6 +398,19 @@ impl AdaptiveConfig {
                 min: self.rto_min,
                 max: self.rto_max,
             });
+        }
+
+        // Profile-specific RTO requirements (Reference profile enforces RFC 6298 parameters)
+        if self.mode == ProfileMode::Reference {
+            if self.rto_min < Duration::from_secs(1) {
+                return Err(ConfigError::InvalidReferenceRtoMin(self.rto_min));
+            }
+            if self.rto_init < Duration::from_secs(1) {
+                return Err(ConfigError::InvalidReferenceRtoInit(self.rto_init));
+            }
+            if self.rto_max < Duration::from_secs(60) {
+                return Err(ConfigError::InvalidReferenceRtoMax(self.rto_max));
+            }
         }
 
         // Loss EWMA time constant

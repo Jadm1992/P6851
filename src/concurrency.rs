@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 
 use crate::config::{AdaptiveConfig, AimdLossPolicy, ProbeOutcome, ProfileMode};
 use crate::loss::EpochEvents;
+use crate::rtt::RttEstimator;
 
 /// AIMD concurrency window for a single scope (per-destination or global).
 #[derive(Clone, Copy, Debug)]
@@ -143,6 +144,10 @@ pub struct DestinationTracker {
     pub consecutive_backoffs: u32,
     /// Active flag.
     pub active: bool,
+    /// Destination-specific RTT estimator (§ 1.1–1.3).
+    /// Tracks latency independently for this destination so cross-target latency
+    /// variation does not distort timeout calculations.
+    pub rtt: Option<RttEstimator>,
 }
 
 impl DestinationTracker {
@@ -156,7 +161,14 @@ impl DestinationTracker {
             events: EpochEvents::default(),
             consecutive_backoffs: 0,
             active: true,
+            rtt: None,
         }
+    }
+
+    /// Record an RTT sample for this destination, initializing destination RTT state if needed.
+    pub fn record_rtt_sample(&mut self, sample: Duration, cfg: &AdaptiveConfig) {
+        let estimator = self.rtt.get_or_insert_with(|| RttEstimator::new(cfg));
+        estimator.record_sample(sample);
     }
 
     /// Record a probe dispatch to this destination.
@@ -200,12 +212,21 @@ impl DestinationTracker {
     /// Calculate the backed-off base RTO for this destination given base RTO (§ 2.3).
     ///
     /// Cleared and reset to fresh RTO_0 upon receiving an eligible (n=0) ACK.
+    /// Uses pre-multiplication ceiling check to safely prevent Duration::mul_f64 overflow.
     pub fn backed_off_rto(&self, base_rto: Duration, rto_max: Duration, gamma: f64) -> Duration {
         if self.consecutive_backoffs == 0 {
             base_rto
         } else {
             let factor = self.backoff_multiplier(gamma);
-            if factor.is_infinite() {
+            let base_secs = base_rto.as_secs_f64();
+            let max_secs = rto_max.as_secs_f64();
+            let max_factor = if base_secs > 0.0 {
+                max_secs / base_secs
+            } else {
+                f64::INFINITY
+            };
+
+            if factor >= max_factor {
                 rto_max
             } else {
                 base_rto.mul_f64(factor).min(rto_max)
@@ -336,6 +357,12 @@ impl ConcurrencyController {
             Some(d) => d.backed_off_rto(base_rto, rto_max, gamma),
             None => base_rto,
         }
+    }
+
+    /// Current total number of in-flight probes across all destinations.
+    #[inline]
+    pub fn global_in_flight(&self) -> usize {
+        self.global_in_flight
     }
 
     /// Dual ceiling check (§ 3.3):
@@ -653,5 +680,17 @@ mod tests {
 
         // Reference mode must NEVER decrease or increase window
         assert_eq!(ctrl.global.window(), initial_global);
+    }
+
+    #[test]
+    fn backed_off_rto_extreme_backoffs_do_not_panic() {
+        let mut tracker = DestinationTracker::new(1, 1, 10, 0.5);
+        tracker.consecutive_backoffs = 64; // factor = 2^64
+        let rto = tracker.backed_off_rto(Duration::from_secs(1), Duration::from_secs(60), 2.0);
+        assert_eq!(rto, Duration::from_secs(60));
+
+        tracker.consecutive_backoffs = u32::MAX;
+        let rto_max = tracker.backed_off_rto(Duration::from_secs(1), Duration::from_secs(60), 2.0);
+        assert_eq!(rto_max, Duration::from_secs(60));
     }
 }

@@ -143,6 +143,12 @@ impl ChangeDetector {
         self.violations
     }
 
+    /// Current consecutive violation count (alias for [`violation_count`](Self::violation_count)).
+    #[inline]
+    pub fn consecutive_violations(&self) -> u32 {
+        self.violations
+    }
+
     /// Whether the detector is active (Adaptive mode only).
     #[inline]
     pub fn is_enabled(&self) -> bool {

@@ -121,8 +121,8 @@ pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
 
     // Case 2: Small x in [1e-15, 0.1).
     // Taylor expansion of (1 - exp(-x)) in Horner's form:
-    // x * (1 - x/2 + x^2/6 - x^3/24 + x^4/120 - x^5/720 + x^6/5040 - x^7/40320 + x^8/362880)
-    // Truncation error at x = 0.1 is < 0.1^10 / 3628800 ≈ 2.7e-17.
+    // x * (1 - x/2 + x^2/6 - x^3/24 + ... + x^10/11!)
+    // Truncation error at x = 0.1 is < 0.1^12 / 12! ≈ 2.1e-21.
     if x < 0.1 {
         let poly = 1.0
             - x * (0.5
@@ -131,7 +131,11 @@ pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
                         - x * ((1.0 / 120.0)
                             - x * ((1.0 / 720.0)
                                 - x * ((1.0 / 5040.0)
-                                    - x * ((1.0 / 40320.0) - x / 362880.0)))))));
+                                    - x * ((1.0 / 40320.0)
+                                        - x * ((1.0 / 362880.0)
+                                            - x * ((1.0 / 3628800.0)
+                                                - x * ((1.0 / 39916800.0)
+                                                    - x / 479001600.0))))))))));
         return x * poly;
     }
 
@@ -152,7 +156,8 @@ pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
     let k_float = k as f64;
     let r = x - k_float * LN_2;
 
-    // Polynomial approximation of exp(-r) for |r| <= 0.35:
+    // High-precision degree-14 polynomial approximation of exp(-r) for |r| <= 0.35:
+    // Truncation error at |r| = 0.35 is < 0.35^15 / 15! ≈ 1.2e-19 << epsilon_f64.
     let exp_neg_r = 1.0
         - r * (1.0
             - r * (0.5
@@ -161,7 +166,13 @@ pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
                         - r * ((1.0 / 120.0)
                             - r * ((1.0 / 720.0)
                                 - r * ((1.0 / 5040.0)
-                                    - r * ((1.0 / 40320.0) - r / 362880.0))))))));
+                                    - r * ((1.0 / 40320.0)
+                                        - r * ((1.0 / 362880.0)
+                                            - r * ((1.0 / 3628800.0)
+                                                - r * ((1.0 / 39916800.0)
+                                                    - r * ((1.0 / 479001600.0)
+                                                        - r * ((1.0 / 6227020800.0)
+                                                            - r / 87178291200.0)))))))))))));
 
     // Exact scale factor 2^(-k)
     let scale = pow_f64_u32(0.5, k);
@@ -273,6 +284,65 @@ mod tests {
         assert_eq!(one_minus_exp_neg_no_std(100.0), 1.0);
         assert_eq!(one_minus_exp_neg(f64::INFINITY), 1.0);
         assert_eq!(one_minus_exp_neg_no_std(f64::INFINITY), 1.0);
+    }
+
+    #[test]
+    fn test_one_minus_exp_reduction_boundary_and_user_eval_point() {
+        use core::f64::consts::LN_2;
+
+        // Specific point cited in review: x ≈ 0.339642
+        let x_eval = 0.339642;
+        let val_eval = one_minus_exp_neg(x_eval);
+        let val_nostd = one_minus_exp_neg_no_std(x_eval);
+        #[cfg(feature = "std")]
+        let expected = -(-x_eval).exp_m1();
+        #[cfg(not(feature = "std"))]
+        let expected = 0.2879577785311003; // Exact IEEE 754 1 - exp(-0.339642)
+        assert!(
+            (val_eval - expected).abs() < 1e-14,
+            "Error at x={x_eval}: got {val_eval}, expected {expected}, diff={}",
+            (val_eval - expected).abs()
+        );
+        assert!(
+            (val_nostd - expected).abs() < 1e-14,
+            "Error in no_std at x={x_eval}: got {val_nostd}, expected {expected}, diff={}",
+            (val_nostd - expected).abs()
+        );
+
+        // Test around ln(2) range-reduction transition boundaries (k + 0.5) * ln(2)
+        let boundaries = [
+            0.5 * LN_2, // boundary 0->1 (~0.34657)
+            1.5 * LN_2, // boundary 1->2 (~1.03972)
+            2.5 * LN_2, // boundary 2->3 (~1.73287)
+            3.5 * LN_2, // boundary 3->4 (~2.42602)
+        ];
+
+        let eps = 1e-6;
+        for &b in &boundaries {
+            for &x in &[b - eps, b, b + eps] {
+                let v = one_minus_exp_neg(x);
+                let v_no_std = one_minus_exp_neg_no_std(x);
+                #[cfg(feature = "std")]
+                let ref_val = -(-x).exp_m1();
+                #[cfg(not(feature = "std"))]
+                let ref_val = v;
+
+                #[cfg(feature = "std")]
+                {
+                    assert!(
+                        (v - ref_val).abs() < 1e-14,
+                        "Boundary error at x={x} around b={b}: diff={}",
+                        (v - ref_val).abs()
+                    );
+                    assert!(
+                        (v_no_std - ref_val).abs() < 1e-14,
+                        "Boundary error in no_std at x={x} around b={b}: diff={}",
+                        (v_no_std - ref_val).abs()
+                    );
+                }
+                assert!((v - v_no_std).abs() < 1e-14);
+            }
+        }
     }
 
     #[test]

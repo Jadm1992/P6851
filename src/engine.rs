@@ -8,7 +8,7 @@ use core::time::Duration;
 
 use crate::change_detector::{ChangeDetector, EpochAccumulator, EpochCloseResult};
 use crate::concurrency::ConcurrencyController;
-use crate::config::{AdaptiveConfig, ProbeOutcome};
+use crate::config::{AdaptiveConfig, ConfigError, ProbeOutcome};
 use crate::loss::{EpochEvents, LossMonitor};
 use crate::p95::RollingP95;
 use crate::rto::ProbeRetrySchedule;
@@ -95,8 +95,14 @@ pub struct AdaptiveEngine {
 }
 
 impl AdaptiveEngine {
-    /// Create a new engine with the given configuration, starting at `now`.
-    pub fn new(cfg: AdaptiveConfig, now: Timestamp) -> Self {
+    /// Create a new engine from the given configuration, starting at `now`.
+    ///
+    /// Validates the configuration before initializing engine components.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] if configuration validation fails.
+    pub fn try_new(cfg: AdaptiveConfig, now: Timestamp) -> Result<Self, ConfigError> {
+        cfg.validate()?;
         let rtt = RttEstimator::new(&cfg);
         let p95 = RollingP95::new(cfg.p95_window_size);
         let change_detector = ChangeDetector::new(&cfg);
@@ -104,7 +110,7 @@ impl AdaptiveEngine {
         let loss = LossMonitor::new(&cfg);
         let current_epoch_duration = cfg.epoch_duration(None);
 
-        Self {
+        Ok(Self {
             cfg,
             rtt,
             p95,
@@ -117,7 +123,15 @@ impl AdaptiveEngine {
             epoch_events: EpochEvents::default(),
             baseline_srtt: Duration::ZERO,
             baseline_rttvar: Duration::ZERO,
-        }
+        })
+    }
+
+    /// Create a new engine with the given configuration, starting at `now`.
+    ///
+    /// # Panics
+    /// Panics if configuration validation fails. Use [`try_new`](Self::try_new) for safe error handling.
+    pub fn new(cfg: AdaptiveConfig, now: Timestamp) -> Self {
+        Self::try_new(cfg, now).expect("invalid AdaptiveConfig")
     }
 
     /// Access the configuration.
@@ -143,6 +157,11 @@ impl AdaptiveEngine {
     /// Access the concurrency controller mutably.
     pub fn concurrency_mut(&mut self) -> &mut ConcurrencyController {
         &mut self.concurrency
+    }
+
+    /// Access the change detector.
+    pub fn change_detector(&self) -> &ChangeDetector {
+        &self.change_detector
     }
 
     /// Access the loss monitor.
@@ -182,6 +201,14 @@ impl AdaptiveEngine {
         self.concurrency.on_dispatch(dest_id);
     }
 
+    /// Attempt to complete a probe for destination `dest_id`.
+    ///
+    /// Returns `true` if an active in-flight probe was decremented on `dest_id` and globally.
+    #[inline]
+    pub fn try_complete(&mut self, dest_id: u64) -> bool {
+        self.concurrency.try_complete(dest_id)
+    }
+
     /// Get the current RTO (or `rto_init` if uninitialized).
     pub fn current_rto(&self) -> Duration {
         if self.rtt.is_initialized() {
@@ -206,14 +233,34 @@ impl AdaptiveEngine {
 
     /// Create a latched per-probe retry schedule for a specific destination.
     ///
-    /// Incorporates destination-level backoff state (§ 2.3) if the destination
-    /// has accumulated unacknowledged retries/losses.
+    /// Uses the destination's isolated RTT estimate if available (preventing
+    /// high-latency targets from skewing timeouts of unrelated targets), falling back
+    /// to the global baseline, and incorporates destination-level backoff state (§ 2.3).
     pub fn latch_dest_retry_schedule(&self, dest_id: u64) -> ProbeRetrySchedule {
-        let mut sched = self.latch_retry_schedule();
-        if let Some(dest) = self.concurrency.get_dest(dest_id).filter(|d| d.consecutive_backoffs > 0) {
-            sched.base_rto = sched.rto_for_attempt(dest.consecutive_backoffs);
-        }
-        sched
+        let (srtt, rttvar, backoffs) = if let Some(dest) = self.concurrency.get_dest(dest_id) {
+            let (s, r) = if let Some(dest_rtt) = &dest.rtt
+                && dest_rtt.is_initialized()
+            {
+                (Some(dest_rtt.srtt()), Some(dest_rtt.rttvar()))
+            } else if self.rtt.is_initialized() {
+                (Some(self.rtt.srtt()), Some(self.rtt.rttvar()))
+            } else {
+                (None, None)
+            };
+            (s, r, dest.consecutive_backoffs)
+        } else if self.rtt.is_initialized() {
+            (Some(self.rtt.srtt()), Some(self.rtt.rttvar()), 0)
+        } else {
+            (None, None, 0)
+        };
+
+        ProbeRetrySchedule::for_destination(&self.cfg, srtt, rttvar, backoffs)
+    }
+
+    /// Access the destination-specific RTT estimator for `dest_id`, if initialized.
+    #[inline]
+    pub fn dest_rtt(&self, dest_id: u64) -> Option<&RttEstimator> {
+        self.concurrency.get_dest(dest_id).and_then(|d| d.rtt.as_ref())
     }
 
     /// Record a probe outcome for the default global destination.
@@ -234,6 +281,12 @@ impl AdaptiveEngine {
         match outcome {
             ProbeOutcome::SuccessInitial { rtt } => {
                 // § 1.1 — Eligible sample (n=0), Karn's rule satisfied.
+                // 1. Destination-isolated RTT estimator tracking:
+                self.concurrency
+                    .get_or_create_dest(dest_id)
+                    .record_rtt_sample(rtt, &self.cfg);
+
+                // 2. Global aggregate RTT estimator, P95, and change detector:
                 self.rtt.record_sample(rtt);
                 self.p95.push(rtt);
                 self.epoch_acc.push(rtt);
@@ -592,5 +645,67 @@ mod tests {
             sched_backed_off.base_rto > sched_normal.base_rto,
             "Destination retry schedule should reflect destination backoff state"
         );
+    }
+
+    #[test]
+    fn try_new_enforces_validation() {
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.alpha = -0.5; // Invalid alpha
+
+        let res = AdaptiveEngine::try_new(cfg, ts(0));
+        assert!(res.is_err(), "try_new should reject invalid alpha");
+
+        let mut cfg_ref = AdaptiveConfig::reference();
+        cfg_ref.rto_min = Duration::from_millis(100); // Invalid for Reference (< 1s)
+        let res_ref = AdaptiveEngine::try_new(cfg_ref, ts(0));
+        assert!(res_ref.is_err(), "try_new should reject invalid Reference rto_min");
+    }
+
+    #[test]
+    fn destination_rtt_isolation() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let fast_dest = 1;
+        let slow_dest = 2;
+
+        // Fast destination receives 20ms samples
+        for _ in 0..5 {
+            engine.record_dest_outcome(fast_dest, ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(20),
+            });
+        }
+
+        // Slow destination receives 300ms samples
+        for _ in 0..5 {
+            engine.record_dest_outcome(slow_dest, ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(300),
+            });
+        }
+
+        // Fast dest schedule should compute tight timeouts around 20ms
+        let sched_fast = engine.latch_dest_retry_schedule(fast_dest);
+        let sched_slow = engine.latch_dest_retry_schedule(slow_dest);
+
+        assert!(
+            sched_fast.base_rto < sched_slow.base_rto,
+            "Fast destination timeout ({:?}) should be lower than slow destination timeout ({:?})",
+            sched_fast.base_rto,
+            sched_slow.base_rto
+        );
+
+        let fast_srtt = engine.dest_rtt(fast_dest).unwrap().srtt();
+        let slow_srtt = engine.dest_rtt(slow_dest).unwrap().srtt();
+
+        assert!(fast_srtt < Duration::from_millis(50));
+        assert!(slow_srtt > Duration::from_millis(200));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid AdaptiveConfig")]
+    fn new_panics_on_invalid_config() {
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.alpha = 2.0; // Invalid alpha > 1.0
+        let _ = AdaptiveEngine::new(cfg, ts(0));
     }
 }

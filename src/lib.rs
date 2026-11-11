@@ -29,5 +29,5 @@ pub use p95::RollingP95;
 pub use change_detector::ChangeDetector;
 pub use rto::ProbeRetrySchedule;
 pub use concurrency::{AimdWindow, ConcurrencyController, DestinationTracker};
-pub use loss::LossMonitor;
+pub use loss::{EpochEvents, LossMonitor};
 pub use engine::{AdaptiveEngine, TelemetrySnapshot, Timestamp};
