@@ -9,6 +9,7 @@ use core::time::Duration;
 use crate::change_detector::{ChangeDetector, EpochAccumulator, EpochCloseResult};
 use crate::concurrency::ConcurrencyController;
 use crate::config::{AdaptiveConfig, ConfigError, ProbeOutcome};
+use crate::execution::{ArenaError, ExecutionCoordinator, PermitError, ProbePermit};
 use crate::loss::{EpochEvents, LossMonitor};
 use crate::p95::RollingP95;
 use crate::rto::ProbeRetrySchedule;
@@ -80,6 +81,7 @@ pub struct AdaptiveEngine {
     change_detector: ChangeDetector,
     concurrency: ConcurrencyController,
     loss: LossMonitor,
+    execution: ExecutionCoordinator,
 
     // Epoch tracking
     epoch_start: Timestamp,
@@ -108,6 +110,7 @@ impl AdaptiveEngine {
         let change_detector = ChangeDetector::new(&cfg);
         let concurrency = ConcurrencyController::new(&cfg);
         let loss = LossMonitor::new(&cfg);
+        let execution = ExecutionCoordinator::new(1024, 256, 256);
         let current_epoch_duration = cfg.epoch_duration(None);
 
         Ok(Self {
@@ -117,6 +120,7 @@ impl AdaptiveEngine {
             change_detector,
             concurrency,
             loss,
+            execution,
             epoch_start: now,
             current_epoch_duration,
             epoch_acc: EpochAccumulator::new(),
@@ -167,6 +171,167 @@ impl AdaptiveEngine {
     /// Access the loss monitor.
     pub fn loss_monitor(&self) -> &LossMonitor {
         &self.loss
+    }
+
+    /// Access the execution coordinator.
+    pub fn execution(&self) -> &ExecutionCoordinator {
+        &self.execution
+    }
+
+    /// Access the execution coordinator mutably.
+    pub fn execution_mut(&mut self) -> &mut ExecutionCoordinator {
+        &mut self.execution
+    }
+
+    /// Allocate a new probe permit in `Reserved` state with pinned destination and group (§ 5 & § 6).
+    pub fn reserve_permit(
+        &mut self,
+        dest_key: u64,
+        group_key: Option<u64>,
+        now: Timestamp,
+        lease: Duration,
+    ) -> Result<ProbePermit, ArenaError> {
+        let now_us = now.as_duration().as_micros() as u64;
+        let lease_us = lease.as_micros() as u64;
+        self.execution
+            .reserve_permit(dest_key, group_key, now_us, lease_us)
+    }
+
+    /// Mark a reserved permit as dispatched to the network (§ 5 & § 7).
+    ///
+    /// Derives destination key from `permit.dest_handle`, performs atomic multi-scope pacing check,
+    /// latches full retry policy, transitions permit to `Dispatched`, and updates concurrency in-flight tracking.
+    pub fn mark_permit_dispatched(
+        &mut self,
+        permit: &mut ProbePermit,
+        now: Timestamp,
+        max_retries: u32,
+    ) -> Result<(), PermitError> {
+        let dest_id = self
+            .execution
+            .dest_arena
+            .get(permit.dest_handle)
+            .copied()
+            .unwrap_or(DEFAULT_DESTINATION_ID);
+        self.mark_dest_permit_dispatched(permit, dest_id, now, max_retries)
+    }
+
+    /// Mark a reserved permit as dispatched to a specific destination (§ 5 & § 7).
+    pub fn mark_dest_permit_dispatched(
+        &mut self,
+        permit: &mut ProbePermit,
+        dest_id: u64,
+        now: Timestamp,
+        max_retries: u32,
+    ) -> Result<(), PermitError> {
+        if let Err(wake_at) = self.concurrency.try_acquire_pacing(dest_id, now.as_duration()) {
+            return Err(PermitError::PaceUntil {
+                wake_at_us: wake_at.as_micros() as u64,
+            });
+        }
+        let schedule = self.latch_dest_retry_schedule(dest_id);
+        permit.mark_dispatched(now.as_duration().as_micros() as u64, &schedule, max_retries)?;
+        self.concurrency.on_dispatch(dest_id);
+        Ok(())
+    }
+
+    /// Advance retry attempt on a dispatched permit (§ 5 & § 7).
+    ///
+    /// Retries must pass multi-scope pacing. If retries are exhausted, transitions to `TimedOut`,
+    /// releases arena pin and concurrency accounting, and does NOT assert packet loss.
+    pub fn retry_permit_dispatched(
+        &mut self,
+        permit: &mut ProbePermit,
+        now: Timestamp,
+    ) -> Result<u32, PermitError> {
+        let dest_id = self
+            .execution
+            .dest_arena
+            .get(permit.dest_handle)
+            .copied()
+            .unwrap_or(DEFAULT_DESTINATION_ID);
+        self.retry_dest_permit_dispatched(permit, dest_id, now)
+    }
+
+    /// Advance retry attempt on a dispatched permit for a specific destination.
+    pub fn retry_dest_permit_dispatched(
+        &mut self,
+        permit: &mut ProbePermit,
+        dest_id: u64,
+        now: Timestamp,
+    ) -> Result<u32, PermitError> {
+        if let Err(wake_at) = self.concurrency.try_acquire_pacing(dest_id, now.as_duration()) {
+            return Err(PermitError::PaceUntil {
+                wake_at_us: wake_at.as_micros() as u64,
+            });
+        }
+        let attempt = permit.on_retry()?;
+        if permit.is_timed_out() {
+            self.execution.release_permit_accounting(permit);
+            self.concurrency.on_completion(dest_id);
+        }
+        Ok(attempt)
+    }
+
+    /// Record a probe outcome on a permit (§ 5).
+    ///
+    /// Transitions permit to `Completed`, releases arena pins, decrements in-flight accounting,
+    /// and feeds the outcome to the RTT estimator, tail tracker, and loss monitor.
+    pub fn record_permit_outcome(
+        &mut self,
+        permit: &mut ProbePermit,
+        outcome: ProbeOutcome,
+    ) -> Result<(), PermitError> {
+        let dest_id = self
+            .execution
+            .dest_arena
+            .get(permit.dest_handle)
+            .copied()
+            .unwrap_or(DEFAULT_DESTINATION_ID);
+        self.record_dest_permit_outcome(permit, dest_id, outcome)
+    }
+
+    /// Record a probe outcome on a permit for a specific destination (§ 5).
+    pub fn record_dest_permit_outcome(
+        &mut self,
+        permit: &mut ProbePermit,
+        dest_id: u64,
+        outcome: ProbeOutcome,
+    ) -> Result<(), PermitError> {
+        permit.record_outcome(outcome)?;
+        self.execution.release_permit_accounting(permit);
+        self.record_dest_outcome(dest_id, outcome);
+        Ok(())
+    }
+
+    /// Cancel a permit (§ 5).
+    ///
+    /// Transitions permit to `Cancelled`, releases arena pins, and decrements in-flight accounting.
+    pub fn cancel_permit(&mut self, permit: &mut ProbePermit) -> Result<(), PermitError> {
+        let dest_id = self
+            .execution
+            .dest_arena
+            .get(permit.dest_handle)
+            .copied()
+            .unwrap_or(DEFAULT_DESTINATION_ID);
+        self.cancel_dest_permit(permit, dest_id)
+    }
+
+    /// Cancel a permit for a specific destination (§ 5).
+    pub fn cancel_dest_permit(
+        &mut self,
+        permit: &mut ProbePermit,
+        dest_id: u64,
+    ) -> Result<(), PermitError> {
+        permit.cancel_probe()?;
+        self.execution.release_permit_accounting(permit);
+        self.concurrency.on_completion(dest_id);
+        Ok(())
+    }
+
+    /// Maintenance tick: processes cancellation queue and forced reclamations (§ 5).
+    pub fn maintenance_tick(&mut self) -> usize {
+        self.execution.maintenance_tick()
     }
 
     /// The snapshotted baseline SRTT used by the change detector for the active epoch.
@@ -321,6 +486,7 @@ impl AdaptiveEngine {
     ///
     /// Returns `true` if an epoch was closed.
     pub fn tick(&mut self, now: Timestamp) -> bool {
+        self.execution.maintenance_tick();
         let elapsed = now.duration_since(self.epoch_start);
 
         if elapsed < self.current_epoch_duration {
@@ -707,5 +873,136 @@ mod tests {
         let mut cfg = AdaptiveConfig::adaptive();
         cfg.alpha = 2.0; // Invalid alpha > 1.0
         let _ = AdaptiveEngine::new(cfg, ts(0));
+    }
+
+    #[test]
+    fn engine_permit_lifecycle_reservation_dispatch_completion() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let dest_id = 42;
+        let group_id = Some(7);
+        let mut permit = engine
+            .reserve_permit(dest_id, group_id, ts(10), Duration::from_millis(500))
+            .expect("reservation should succeed");
+
+        assert_eq!(permit.dest_handle.slot(), 0);
+        assert!(engine.execution().dest_arena.is_pinned(permit.dest_handle));
+        if let Some(gh) = permit.group_handle {
+            assert!(engine.execution().group_arena.is_pinned(gh));
+        }
+
+        // Concurrency in-flight is 0 until dispatched
+        assert_eq!(engine.concurrency().global_in_flight, 0);
+
+        // Dispatch
+        engine
+            .mark_permit_dispatched(&mut permit, ts(20), 3)
+            .expect("dispatch should succeed");
+        assert_eq!(engine.concurrency().global_in_flight, 1);
+
+        // Complete with initial success
+        engine
+            .record_permit_outcome(
+                &mut permit,
+                ProbeOutcome::SuccessInitial {
+                    rtt: Duration::from_millis(60),
+                },
+            )
+            .expect("outcome record should succeed");
+
+        assert_eq!(engine.concurrency().global_in_flight, 0);
+        assert!(!engine.execution().dest_arena.is_pinned(permit.dest_handle));
+        if let Some(gh) = permit.group_handle {
+            assert!(!engine.execution().group_arena.is_pinned(gh));
+        }
+        assert!(permit.is_completed());
+        assert!(engine.rtt().is_initialized());
+    }
+
+    #[test]
+    fn engine_permit_atomic_pacing_gating() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let dest_id = 10;
+        // Set pacing interval to 100ms
+        engine
+            .concurrency_mut()
+            .set_pacer(Some(dest_id), None, Duration::from_millis(100));
+
+        let mut p1 = engine
+            .reserve_permit(dest_id, None, ts(0), Duration::from_secs(1))
+            .unwrap();
+        let mut p2 = engine
+            .reserve_permit(dest_id, None, ts(0), Duration::from_secs(1))
+            .unwrap();
+
+        // P1 dispatched at t=0
+        assert!(engine.mark_permit_dispatched(&mut p1, ts(0), 3).is_ok());
+
+        // P2 dispatched at t=0 must be rejected by pacer with PaceUntil
+        let pace_err = engine
+            .mark_permit_dispatched(&mut p2, ts(0), 3)
+            .unwrap_err();
+        match pace_err {
+            PermitError::PaceUntil { wake_at_us } => {
+                assert_eq!(wake_at_us, 100_000, "Wake at should be 100ms (100,000 µs)");
+            }
+            other => panic!("Expected PaceUntil, got {other:?}"),
+        }
+
+        // At t=100ms, P2 dispatch succeeds
+        assert!(engine
+            .mark_permit_dispatched(&mut p2, ts(100), 3)
+            .is_ok());
+    }
+
+    #[test]
+    fn engine_permit_retry_timeout_no_automatic_loss() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut engine = AdaptiveEngine::new(cfg, ts(0));
+
+        let dest_id = 99;
+        let mut permit = engine
+            .reserve_permit(dest_id, None, ts(0), Duration::from_secs(1))
+            .unwrap();
+
+        engine
+            .mark_permit_dispatched(&mut permit, ts(0), 2)
+            .unwrap();
+        assert_eq!(engine.concurrency().global_in_flight, 1);
+
+        // Attempt 1
+        assert_eq!(
+            engine.retry_permit_dispatched(&mut permit, ts(100)).unwrap(),
+            1
+        );
+        assert_eq!(engine.concurrency().global_in_flight, 1);
+
+        // Attempt 2
+        assert_eq!(
+            engine.retry_permit_dispatched(&mut permit, ts(250)).unwrap(),
+            2
+        );
+        assert_eq!(engine.concurrency().global_in_flight, 1);
+
+        // Attempt 3 exceeds max_retries=2 -> TimedOut, releases accounting
+        assert_eq!(
+            engine.retry_permit_dispatched(&mut permit, ts(500)).unwrap(),
+            3
+        );
+        assert!(permit.is_timed_out());
+        assert_eq!(
+            engine.concurrency().global_in_flight,
+            0,
+            "TimedOut permit must release in-flight accounting"
+        );
+        assert!(
+            !engine.execution().dest_arena.is_pinned(permit.dest_handle),
+            "TimedOut permit must unpin arena slot"
+        );
+        // Does not assert packet loss automatically (§ 5)
+        assert_eq!(engine.loss_monitor().d_loss(), 0.0);
     }
 }

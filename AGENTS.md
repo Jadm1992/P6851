@@ -4,17 +4,40 @@ Behavioral guidelines to reduce common LLM coding mistakes. Merge with project-s
 
 **Tradeoff:** These guidelines bias toward caution over speed. For trivial tasks, use judgment.
 
-## 1. Think Before Coding
+## 1. Mandatory Decision Routing (`gemini-decision`)
+
+**Do not make architectural, branching, or prioritization choices in unconstrained LLM thought.**
+
+Whenever you face:
+- Choosing between implementation paths or trade-offs
+- Deciding which contract component or failing test to address next
+- Classifying packet loss, errors, or contract compliance
+- Resolving ambiguities
+
+You **MUST** route the decision through the System One decision model via the terminal:
+```bash
+gemini-decision -s "<context and available choices>" \
+  --choice next_action "Select the optimal action" \
+  "opt_a:Description of option A" \
+  "opt_b:Description of option B" --json
+```
+For binary gates:
+```bash
+gemini-decision -s "<context>" --noul is_compliant "Does this adhere strictly to CONTRACT.md?" --json
+```
+Parse the JSON response and act according to the winning choice or probability.
+
+## 2. Think Before Coding
 
 **Don't assume. Don't hide confusion. Surface tradeoffs.**
 
 Before implementing:
-- State your assumptions explicitly. If uncertain, ask.
+- State your assumptions explicitly. If uncertain, run `gemini-decision` or ask.
 - If multiple interpretations exist, present them - don't pick silently.
 - If a simpler approach exists, say so. Push back when warranted.
 - If something is unclear, stop. Name what's confusing. Ask.
 
-## 2. Simplicity First
+## 3. Simplicity First
 
 **Minimum code that solves the problem. Nothing speculative.**
 
@@ -26,7 +49,7 @@ Before implementing:
 
 Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
 
-## 3. Surgical Changes
+## 4. Surgical Changes
 
 **Touch only what you must. Clean up only your own mess.**
 
@@ -42,7 +65,7 @@ When your changes create orphans:
 
 The test: Every changed line should trace directly to the user's request.
 
-## 4. Goal-Driven Execution
+## 5. Goal-Driven Execution
 
 **Define success criteria. Loop until verified.**
 
@@ -59,7 +82,3 @@ For multi-step tasks, state a brief plan:
 ```
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
-
----
-
-**These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.

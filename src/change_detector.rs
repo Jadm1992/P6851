@@ -83,6 +83,12 @@ impl EpochAccumulator {
     pub fn reset(&mut self) {
         self.samples.clear();
     }
+
+    /// Reference to the collected samples in this epoch.
+    #[inline]
+    pub fn samples(&self) -> &[Duration] {
+        &self.samples
+    }
 }
 
 /// Regime-change detector state.
@@ -105,6 +111,10 @@ pub struct ChangeDetector {
     reanchor_strategy: ReanchorVariationStrategy,
     /// Whether the detector is enabled (disabled for Reference profile).
     enabled: bool,
+    /// Retained per-epoch medians M_1..M_m across consecutive violating epochs.
+    retained_medians: Vec<Duration>,
+    /// Retained eligible samples R_1..R_N across consecutive violating epochs.
+    retained_samples: Vec<Duration>,
 }
 
 /// Result of closing an epoch through the change detector.
@@ -134,6 +144,8 @@ impl ChangeDetector {
             rttvar_min: cfg.rttvar_min,
             reanchor_strategy: cfg.reanchor_strategy,
             enabled: cfg.mode == crate::config::ProfileMode::Adaptive,
+            retained_medians: Vec::new(),
+            retained_samples: Vec::new(),
         }
     }
 
@@ -196,20 +208,34 @@ impl ChangeDetector {
 
         if median > threshold {
             self.violations += 1;
+            self.retained_medians.push(median);
+            self.retained_samples.extend_from_slice(acc.samples());
 
             if self.violations >= self.change_m {
-                // Forced unclamped re-anchoring (§ 1.5 item 3):
-                // SRTT ← M_e
-                // RTTVAR determined by configured strategy
+                // Forced unclamped re-anchoring (CONTRACT.md § 2):
+                // SRTT_new = median(M_1, ..., M_m)
+                let mut medians = self.retained_medians.clone();
+                medians.sort_unstable();
+                let n_m = medians.len();
+                let new_srtt = if n_m % 2 == 1 {
+                    medians[n_m / 2]
+                } else {
+                    let a = medians[n_m / 2 - 1];
+                    let b = medians[n_m / 2];
+                    (a + b) / 2
+                };
+
                 let candidate_rttvar = match self.reanchor_strategy {
                     ReanchorVariationStrategy::MedianStep => {
-                        // RTTVAR ← max(RTTVAR_min, |M_e − baseline_SRTT| / 2)
-                        let diff_secs = (median.as_secs_f64() - baseline_srtt.as_secs_f64()).abs();
+                        // Spec default: RTTVAR = max(RTTVAR_min, |M_e − baseline_SRTT| / 2)
+                        let diff_secs = (new_srtt.as_secs_f64() - baseline_srtt.as_secs_f64()).abs();
                         Duration::from_secs_f64(diff_secs / 2.0)
                     }
                     ReanchorVariationStrategy::EpochSampleVariation => {
-                        // Measure variation directly within the violating epoch's samples
-                        acc.mean_absolute_deviation(median)
+                        // CONTRACT.md § 2:
+                        // RTTVAR_new = max(RTTVAR_min, 1/N * sum_{i=1}^N |R_i - SRTT_new|)
+                        // across all retained samples R_1..R_N
+                        compute_mad_nanos(&self.retained_samples, new_srtt)
                     }
                 };
 
@@ -220,9 +246,11 @@ impl ChangeDetector {
                 };
 
                 self.violations = 0;
+                self.retained_medians.clear();
+                self.retained_samples.clear();
 
                 EpochCloseResult::ReAnchor {
-                    new_srtt: median,
+                    new_srtt,
                     new_rttvar,
                 }
             } else {
@@ -231,16 +259,37 @@ impl ChangeDetector {
                 }
             }
         } else {
-            // Non-violating epoch: reset counter (§ 1.5 item 3).
+            // Non-violating epoch: reset counter and retained history (CONTRACT.md § 2).
             self.violations = 0;
+            self.retained_medians.clear();
+            self.retained_samples.clear();
             EpochCloseResult::Normal
         }
     }
 
-    /// Reset the violation counter (e.g., after manual re-anchoring).
+    /// Reset the violation counter and retained samples (e.g., after manual re-anchoring).
     pub fn reset(&mut self) {
         self.violations = 0;
+        self.retained_medians.clear();
+        self.retained_samples.clear();
     }
+}
+
+/// Compute Mean Absolute Deviation (MAD) of samples around the given center duration.
+fn compute_mad_nanos(samples: &[Duration], center: Duration) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    let center_nanos = center.as_nanos();
+    let mut sum_diff_nanos: u128 = 0;
+    for &s in samples {
+        let diff = s.as_nanos().abs_diff(center_nanos);
+        sum_diff_nanos = sum_diff_nanos.saturating_add(diff);
+    }
+    let avg_diff_nanos = sum_diff_nanos / (samples.len() as u128);
+    let secs = (avg_diff_nanos / 1_000_000_000) as u64;
+    let subsec_nanos = (avg_diff_nanos % 1_000_000_000) as u32;
+    Duration::new(secs, subsec_nanos)
 }
 
 #[cfg(test)]
@@ -383,5 +432,47 @@ mod tests {
 
         let acc2 = make_acc(&[10, 30, 20, 40]); // sorted: [10, 20, 30, 40] → (20+30)/2 = 25
         assert_eq!(acc2.median(), Some(Duration::from_millis(25)));
+    }
+
+    #[test]
+    fn multi_epoch_varying_retained_samples_contract() {
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.reanchor_strategy = ReanchorVariationStrategy::EpochSampleVariation;
+        let mut det = ChangeDetector::new(&cfg);
+
+        let baseline_srtt = Duration::from_millis(50);
+        let baseline_rttvar = Duration::from_millis(10);
+        // threshold = 50 + 3*10 = 80ms
+
+        // Epoch 1: [190, 200, 210] -> median 200ms
+        let acc1 = make_acc(&[190, 200, 210]);
+        let res1 = det.close_epoch(&acc1, baseline_srtt, baseline_rttvar);
+        assert_eq!(res1, EpochCloseResult::Violation { consecutive: 1 });
+
+        // Epoch 2: [240, 250, 260] -> median 250ms
+        let acc2 = make_acc(&[240, 250, 260]);
+        let res2 = det.close_epoch(&acc2, baseline_srtt, baseline_rttvar);
+        assert_eq!(res2, EpochCloseResult::Violation { consecutive: 2 });
+
+        // Epoch 3: [290, 300, 310] -> median 300ms
+        let acc3 = make_acc(&[290, 300, 310]);
+        let res3 = det.close_epoch(&acc3, baseline_srtt, baseline_rttvar);
+
+        // Medians: [200, 250, 300] -> median of medians = 250ms
+        // Samples R_1..R_9: [190, 200, 210, 240, 250, 260, 290, 300, 310]
+        // Diff from 250: |190-250|=60, |200-250|=50, |210-250|=40, |240-250|=10, |250-250|=0,
+        //               |260-250|=10, |290-250|=40, |300-250|=50, |310-250|=60.
+        // Sum = 60+50+40+10+0+10+40+50+60 = 320ms.
+        // MAD = 320ms / 9 = 35.555... ms = 35_555_555 ns.
+        match res3 {
+            EpochCloseResult::ReAnchor {
+                new_srtt,
+                new_rttvar,
+            } => {
+                assert_eq!(new_srtt, Duration::from_millis(250));
+                assert_eq!(new_rttvar.as_millis(), 35);
+            }
+            other => panic!("Expected ReAnchor, got {:?}", other),
+        }
     }
 }

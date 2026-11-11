@@ -8,6 +8,8 @@ use core::time::Duration;
 
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
+#[cfg(not(feature = "std"))]
+use alloc::vec;
 
 use crate::config::{AdaptiveConfig, AimdLossPolicy, ProbeOutcome, ProfileMode};
 use crate::loss::EpochEvents;
@@ -129,11 +131,103 @@ impl AimdWindow {
     }
 }
 
+/// Independent leaky-bucket / rate pacer (§ 7).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Pacer {
+    /// Transmission interval (minimum spacing between packets).
+    pub interval: Duration,
+    /// Earliest timestamp (duration since epoch) when transmission is permitted.
+    pub next_tx: Duration,
+}
+
+impl Pacer {
+    /// Create a new pacer with the given rate interval.
+    pub fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_tx: Duration::ZERO,
+        }
+    }
+
+    /// Check if transmission is allowed at `now`.
+    /// Returns `None` if allowed, or `Some(wake_at)` if pacing delay is required.
+    #[inline]
+    pub fn check(&self, now: Duration) -> Option<Duration> {
+        if now >= self.next_tx {
+            None
+        } else {
+            Some(self.next_tx)
+        }
+    }
+
+    /// Advance the pacer by one transmission.
+    #[inline]
+    pub fn consume(&mut self, now: Duration) {
+        let base = if now > self.next_tx { now } else { self.next_tx };
+        self.next_tx = base.saturating_add(self.interval);
+    }
+}
+
+/// Group-level state tracking concurrency and pacing (§ 3 & § 7).
+#[derive(Clone, Debug)]
+pub struct GroupTracker {
+    /// Group identifier.
+    pub id: u64,
+    /// Per-group AIMD window C_g.
+    pub window: AimdWindow,
+    /// In-flight probes in this group.
+    pub in_flight: usize,
+    /// Accumulated epoch events for this group.
+    pub events: EpochEvents,
+    /// Independent group pacer (§ 7).
+    pub pacer: Option<Pacer>,
+    /// Active flag.
+    pub active: bool,
+}
+
+impl GroupTracker {
+    pub fn new(id: u64, c_min: usize, c_max: usize, delta: f64) -> Self {
+        let safe_min = c_min.max(1);
+        let safe_max = c_max.max(safe_min);
+        Self {
+            id,
+            window: AimdWindow::new(safe_min, safe_min, safe_max, delta),
+            in_flight: 0,
+            events: EpochEvents::default(),
+            pacer: None,
+            active: true,
+        }
+    }
+
+    /// Record an outcome for this group.
+    pub fn record_outcome(&mut self, outcome: ProbeOutcome) {
+        match outcome {
+            ProbeOutcome::SuccessInitial { .. } | ProbeOutcome::SuccessRetransmitted { .. } => {
+                self.events.successes += 1;
+            }
+            ProbeOutcome::ExpectedSilence => {
+                self.events.expected_silence += 1;
+            }
+            ProbeOutcome::InferredLoss => {
+                self.events.inferred_loss += 1;
+            }
+            ProbeOutcome::InferredRateLimit => {
+                self.events.inferred_rate_limit += 1;
+            }
+            ProbeOutcome::Unclassified => {
+                self.events.unclassified += 1;
+            }
+        }
+    }
+}
+
 /// Destination-level state tracking concurrency and backoff (§ 2.3 & § 3.3).
 #[derive(Clone, Debug)]
 pub struct DestinationTracker {
     /// Destination identifier.
     pub id: u64,
+    /// Group to which this destination belongs (if any).
+    pub group_id: Option<u64>,
     /// Per-destination AIMD window C_d.
     pub window: AimdWindow,
     /// Current number of probes in-flight to this destination.
@@ -148,6 +242,8 @@ pub struct DestinationTracker {
     /// Tracks latency independently for this destination so cross-target latency
     /// variation does not distort timeout calculations.
     pub rtt: Option<RttEstimator>,
+    /// Independent destination pacer (§ 7).
+    pub pacer: Option<Pacer>,
 }
 
 impl DestinationTracker {
@@ -156,12 +252,14 @@ impl DestinationTracker {
         let safe_max = c_max.max(safe_min);
         Self {
             id,
+            group_id: None,
             window: AimdWindow::new(safe_min, safe_min, safe_max, delta),
             in_flight: 0,
             events: EpochEvents::default(),
             consecutive_backoffs: 0,
             active: true,
             rtt: None,
+            pacer: None,
         }
     }
 
@@ -263,10 +361,10 @@ impl DestinationTracker {
     }
 }
 
-/// Dual-ceiling concurrency controller (§ 3.3).
+/// Dual/triple-ceiling concurrency controller with independent pacing (§ 3.3 & § 7).
 ///
-/// Enforces both per-destination and global concurrency limits via independent
-/// AIMD windows.
+/// Enforces per-destination, per-group, and global concurrency limits via independent
+/// AIMD windows, and provides atomic hierarchical pacing across all scopes.
 #[derive(Clone, Debug)]
 pub struct ConcurrencyController {
     /// Global AIMD window C_global.
@@ -275,6 +373,14 @@ pub struct ConcurrencyController {
     pub global_in_flight: usize,
     /// Tracked destinations.
     pub destinations: Vec<DestinationTracker>,
+    /// Tracked destination groups (§ 3).
+    pub groups: Vec<GroupTracker>,
+    /// Independent global pacer (§ 7).
+    pub global_pacer: Option<Pacer>,
+    /// Minimum distinct groups required for global evidence (§ 3): G_min = 4.
+    pub g_min: usize,
+    /// Maximum fractional contribution per group (§ 3): f_max = 0.25.
+    pub f_max: f64,
     /// Profile mode (Reference enforces static ceiling; Adaptive runs AIMD).
     mode: ProfileMode,
     /// Per-destination AIMD parameters.
@@ -314,6 +420,10 @@ impl ConcurrencyController {
             ),
             global_in_flight: 0,
             destinations: Vec::new(),
+            groups: Vec::new(),
+            global_pacer: None,
+            g_min: 4,
+            f_max: 0.25,
             mode: cfg.mode,
             dest_delta: cfg.aimd_delta,
             dest_c_min: initial_dest,
@@ -321,6 +431,122 @@ impl ConcurrencyController {
             loss_policy: cfg.aimd_loss_policy,
             min_completed_probes: safe_min_completed,
         }
+    }
+
+    /// Find or create a group tracker (§ 3).
+    pub fn get_or_create_group(&mut self, group_id: u64) -> &mut GroupTracker {
+        if let Some(pos) = self.groups.iter().position(|g| g.id == group_id) {
+            return &mut self.groups[pos];
+        }
+        let tracker = GroupTracker::new(
+            group_id,
+            self.dest_c_min,
+            self.dest_c_max,
+            self.dest_delta,
+        );
+        self.groups.push(tracker);
+        self.groups.last_mut().unwrap()
+    }
+
+    /// Find an existing group tracker.
+    pub fn get_group(&self, group_id: u64) -> Option<&GroupTracker> {
+        self.groups.iter().find(|g| g.id == group_id)
+    }
+
+    /// Find an existing group tracker mutably.
+    pub fn get_group_mut(&mut self, group_id: u64) -> Option<&mut GroupTracker> {
+        self.groups.iter_mut().find(|g| g.id == group_id)
+    }
+
+    /// Assign destination `dest_id` to group `group_id`.
+    pub fn set_dest_group(&mut self, dest_id: u64, group_id: u64) {
+        let _ = self.get_or_create_group(group_id);
+        let dest = self.get_or_create_dest(dest_id);
+        dest.group_id = Some(group_id);
+    }
+
+    /// Configure a transmission pacer on global, group, or destination scope (§ 7).
+    pub fn set_pacer(&mut self, dest_id: Option<u64>, group_id: Option<u64>, interval: Duration) {
+        if let Some(did) = dest_id {
+            let dest = self.get_or_create_dest(did);
+            dest.pacer = Some(Pacer::new(interval));
+        } else if let Some(gid) = group_id {
+            let group = self.get_or_create_group(gid);
+            group.pacer = Some(Pacer::new(interval));
+        } else {
+            self.global_pacer = Some(Pacer::new(interval));
+        }
+    }
+
+    /// Atomically check and acquire pacing reservation across all applicable scopes (§ 7).
+    ///
+    /// If all scopes permit transmission at `now`:
+    ///   Consumes atomic reservation across all applicable pacers and returns `Ok(())`.
+    /// If ANY scope requires pacing:
+    ///   NONE of the pacers are consumed, and returns `Err(wake_at)` with the maximum
+    ///   required wake timestamp.
+    pub fn try_acquire_pacing(&mut self, dest_id: u64, now: Duration) -> Result<(), Duration> {
+        let mut wake_at = now;
+        let mut must_wait = false;
+
+        // 1. Check global pacer
+        if let Some(p) = &self.global_pacer
+            && let Some(w) = p.check(now)
+        {
+            must_wait = true;
+            if w > wake_at {
+                wake_at = w;
+            }
+        }
+
+        // Find destination and group
+        let group_id = self.get_dest(dest_id).and_then(|d| d.group_id);
+
+        // 2. Check group pacer
+        if let Some(gid) = group_id
+            && let Some(g) = self.get_group(gid)
+            && let Some(p) = &g.pacer
+            && let Some(w) = p.check(now)
+        {
+            must_wait = true;
+            if w > wake_at {
+                wake_at = w;
+            }
+        }
+
+        // 3. Check destination pacer
+        if let Some(d) = self.get_dest(dest_id)
+            && let Some(p) = &d.pacer
+            && let Some(w) = p.check(now)
+        {
+            must_wait = true;
+            if w > wake_at {
+                wake_at = w;
+            }
+        }
+
+        if must_wait {
+            // Atomic failure: NONE of the tokens are consumed
+            return Err(wake_at);
+        }
+
+        // Atomic success: consume all applicable pacers
+        if let Some(p) = &mut self.global_pacer {
+            p.consume(now);
+        }
+        if let Some(gid) = group_id
+            && let Some(g) = self.get_group_mut(gid)
+            && let Some(p) = &mut g.pacer
+        {
+            p.consume(now);
+        }
+        if let Some(d) = self.get_dest_mut(dest_id)
+            && let Some(p) = &mut d.pacer
+        {
+            p.consume(now);
+        }
+
+        Ok(())
     }
 
     /// Find or create a destination tracker.
@@ -341,6 +567,11 @@ impl ConcurrencyController {
     /// Find an existing destination tracker.
     pub fn get_dest(&self, dest_id: u64) -> Option<&DestinationTracker> {
         self.destinations.iter().find(|d| d.id == dest_id)
+    }
+
+    /// Find an existing destination tracker mutably.
+    pub fn get_dest_mut(&mut self, dest_id: u64) -> Option<&mut DestinationTracker> {
+        self.destinations.iter_mut().find(|d| d.id == dest_id)
     }
 
     /// Get the destination-backed-off RTO for a specific destination (§ 2.3).
@@ -365,17 +596,24 @@ impl ConcurrencyController {
         self.global_in_flight
     }
 
-    /// Dual ceiling check (§ 3.3):
+    /// Hierarchical ceiling check (§ 3.3):
     ///
-    /// in_flight_d < C_d  AND  Σ in_flight_d < C_global.
+    /// Checks global ceiling, group ceiling (if assigned), and destination ceiling.
     #[inline]
     pub fn can_dispatch(&self, dest_id: u64) -> bool {
         if !self.global.can_dispatch(self.global_in_flight) {
             return false;
         }
-        match self.get_dest(dest_id) {
-            Some(d) => d.window.can_dispatch(d.in_flight),
-            None => true, // Window allows at least initial probe
+        if let Some(d) = self.get_dest(dest_id) {
+            if let Some(gid) = d.group_id
+                && let Some(g) = self.get_group(gid)
+                && !g.window.can_dispatch(g.in_flight)
+            {
+                return false;
+            }
+            d.window.can_dispatch(d.in_flight)
+        } else {
+            true // Window allows at least initial probe
         }
     }
 
@@ -384,17 +622,29 @@ impl ConcurrencyController {
         self.global_in_flight = self.global_in_flight.saturating_add(1);
         let dest = self.get_or_create_dest(dest_id);
         dest.on_dispatch();
+        let group_id = dest.group_id;
+        if let Some(gid) = group_id
+            && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
+        {
+            g.in_flight = g.in_flight.saturating_add(1);
+        }
     }
 
     /// Attempt to complete a probe for destination `dest_id`.
     ///
-    /// Only decrements the global in-flight counter if a matching destination exists
+    /// Only decrements in-flight counters if a matching destination exists
     /// and had an active in-flight probe. Returns `true` on successful completion,
     /// or `false` on duplicate/mismatched completion.
     pub fn try_complete(&mut self, dest_id: u64) -> bool {
         if let Some(dest) = self.destinations.iter_mut().find(|d| d.id == dest_id)
             && dest.try_complete()
         {
+            let group_id = dest.group_id;
+            if let Some(gid) = group_id
+                && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
+            {
+                g.in_flight = g.in_flight.saturating_sub(1);
+            }
             self.global_in_flight = self.global_in_flight.saturating_sub(1);
             return true;
         }
@@ -402,9 +652,6 @@ impl ConcurrencyController {
     }
 
     /// Record a probe completion/expiration for destination `dest_id`.
-    ///
-    /// Ensures global in-flight counters are only decremented when an actual
-    /// in-flight probe completes.
     #[inline]
     pub fn on_completion(&mut self, dest_id: u64) {
         self.try_complete(dest_id);
@@ -414,10 +661,16 @@ impl ConcurrencyController {
     pub fn record_dest_outcome(&mut self, dest_id: u64, outcome: ProbeOutcome) {
         let dest = self.get_or_create_dest(dest_id);
         dest.record_outcome(outcome);
+        let group_id = dest.group_id;
+        if let Some(gid) = group_id
+            && let Some(g) = self.groups.iter_mut().find(|g| g.id == gid)
+        {
+            g.record_outcome(outcome);
+        }
     }
 
-    /// Close an epoch and apply AIMD state transitions to all active destinations
-    /// and the global window (§ 3.2 & § 3.3).
+    /// Close an epoch and apply AIMD state transitions to all active destinations,
+    /// groups, and global window (§ 3.2 & § 3.3).
     ///
     /// If `ProfileMode::Reference`, windows are fixed at their ceilings.
     pub fn apply_epoch(&mut self) {
@@ -427,25 +680,19 @@ impl ConcurrencyController {
             for dest in &mut self.destinations {
                 dest.events = EpochEvents::default();
             }
+            for group in &mut self.groups {
+                group.events = EpochEvents::default();
+            }
             return;
         }
 
-        let mut global_has_loss = false;
-        let mut global_has_rate_limit = false;
         let mut global_completions: usize = 0;
 
-        // Apply per-destination transitions
+        // 1. Apply per-destination transitions (isolated to destination)
         for dest in &mut self.destinations {
             let has_loss = dest.events.inferred_loss > 0;
             let has_rate = dest.events.inferred_rate_limit > 0;
             let completions = dest.events.successes + dest.events.inferred_loss + dest.events.inferred_rate_limit;
-
-            if has_loss {
-                global_has_loss = true;
-            }
-            if has_rate {
-                global_has_rate_limit = true;
-            }
             global_completions = global_completions.saturating_add(completions);
 
             let dest_outcome = if has_loss && has_rate {
@@ -464,21 +711,136 @@ impl ConcurrencyController {
             dest.events = EpochEvents::default();
         }
 
-        // Apply global transition
-        let global_outcome = if global_has_loss && global_has_rate_limit {
-            EpochOutcome::LossAndRateLimit
-        } else if global_has_loss {
-            EpochOutcome::Loss
-        } else if global_has_rate_limit {
-            EpochOutcome::RateLimit
-        } else if global_completions >= self.min_completed_probes && global_completions > 0 {
-            EpochOutcome::Lossless
+        // 2. Apply per-group transitions (isolated to group) and gather global evidence
+        let mut groups_satisfying_trigger = 0;
+        let mut group_raw_confidences = Vec::new();
+        let mut group_has_rate = false;
+
+        for group in &mut self.groups {
+            let has_loss = group.events.inferred_loss > 0;
+            let has_rate = group.events.inferred_rate_limit > 0;
+            let eligible = group.events.eligible_count();
+
+            if has_rate {
+                group_has_rate = true;
+            }
+
+            let raw_c_loss = group.events.inferred_loss as f64;
+            group_raw_confidences.push(raw_c_loss);
+
+            // Loss trigger per group tier: n_eligible >= N_min, sum c_loss >= E_min, sum c_loss / n >= p_min
+            let trigger_met = eligible >= 1 && raw_c_loss >= 1.0 && (raw_c_loss / (eligible as f64)) >= 0.05;
+            if trigger_met {
+                groups_satisfying_trigger += 1;
+            }
+
+            let group_outcome = if has_loss && has_rate {
+                EpochOutcome::LossAndRateLimit
+            } else if has_loss {
+                EpochOutcome::Loss
+            } else if has_rate {
+                EpochOutcome::RateLimit
+            } else if eligible >= self.min_completed_probes && eligible > 0 {
+                EpochOutcome::Lossless
+            } else {
+                EpochOutcome::Idle
+            };
+
+            group.window.apply_epoch(group_outcome, self.loss_policy);
+            group.events = EpochEvents::default();
+        }
+
+        // 3. Apply global transition (§ 3: Global Evidence & Water-Filling)
+        let global_outcome = if !self.groups.is_empty() {
+            // Hierarchical Mode:
+            // Global evidence holds in an epoch iff:
+            // - At least G_min distinct groups each independently satisfy their own loss-trigger conditions
+            // - The consistent capped sum S meets global evidence and loss-rate thresholds
+            let (capped_s, _) = solve_water_filling(&group_raw_confidences, self.f_max);
+            let global_loss_trigger = groups_satisfying_trigger >= self.g_min
+                && capped_s >= 1.0
+                && (global_completions > 0 && (capped_s / (global_completions as f64)) >= 0.05);
+
+            if global_loss_trigger {
+                if group_has_rate {
+                    EpochOutcome::LossAndRateLimit
+                } else {
+                    EpochOutcome::Loss
+                }
+            } else if group_has_rate && groups_satisfying_trigger >= self.g_min {
+                EpochOutcome::RateLimit
+            } else if global_completions >= self.min_completed_probes && global_completions > 0 {
+                EpochOutcome::Lossless
+            } else {
+                EpochOutcome::Idle
+            }
         } else {
-            EpochOutcome::Idle
+            // Flat/single-tier mode (no groups configured)
+            // Destination decrease is isolated to destination; global maintains or increases on lossless
+            if global_completions >= self.min_completed_probes && global_completions > 0 {
+                EpochOutcome::Lossless
+            } else {
+                EpochOutcome::Idle
+            }
         };
 
         self.global.apply_epoch(global_outcome, self.loss_policy);
     }
+}
+
+/// Solves the fixed-point water-filling equation (CONTRACT.md § 3):
+///
+/// \[ S = \sum_g \min(c_g,\, f_{\max} S) \]
+///
+/// Returns `(S, [c'_g])` where `c'_g = min(c_g, f_max * S)` is each group's capped contribution.
+/// A single group cannot exceed `f_max` of the final capped total `S`.
+pub fn solve_water_filling(c_list: &[f64], f_max: f64) -> (f64, Vec<f64>) {
+    if c_list.is_empty() || f_max <= 0.0 || f_max > 1.0 {
+        return (0.0, Vec::new());
+    }
+
+    let mut indexed: Vec<(usize, f64)> = c_list.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(core::cmp::Ordering::Equal));
+
+    let k_total = indexed.len();
+    let s_total: f64 = c_list.iter().sum();
+    if s_total <= 0.0 {
+        return (0.0, vec![0.0; k_total]);
+    }
+
+    // Check if uncapped total already satisfies c_g <= f_max * S for all g:
+    let all_uncapped = indexed.iter().all(|&(_, c)| c <= f_max * s_total + 1e-9);
+    if all_uncapped {
+        return (s_total, c_list.to_vec());
+    }
+
+    // Search for consistent number of uncapped groups k:
+    // S = (sum_{j=0}^{k-1} c_(j)) / (1.0 - (K - k) * f_max)
+    let mut best_s = 0.0;
+    for k in 0..k_total {
+        let uncapped_sum: f64 = indexed[..k].iter().map(|&(_, c)| c).sum();
+        let denom = 1.0 - ((k_total - k) as f64) * f_max;
+        if denom > 0.0 {
+            let s_cand = uncapped_sum / denom;
+            let mut consistent = true;
+            if k > 0 && indexed[k - 1].1 > f_max * s_cand + 1e-9 {
+                consistent = false;
+            }
+            if k < k_total && indexed[k].1 < f_max * s_cand - 1e-9 {
+                consistent = false;
+            }
+            if consistent {
+                best_s = s_cand;
+                break;
+            }
+        }
+    }
+
+    let mut capped = vec![0.0; k_total];
+    for (orig_idx, &c) in c_list.iter().enumerate() {
+        capped[orig_idx] = c.min(f_max * best_s);
+    }
+    (best_s, capped)
 }
 
 #[cfg(test)]
@@ -692,5 +1054,154 @@ mod tests {
         tracker.consecutive_backoffs = u32::MAX;
         let rto_max = tracker.backed_off_rto(Duration::from_secs(1), Duration::from_secs(60), 2.0);
         assert_eq!(rto_max, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_solve_water_filling_contract() {
+        // 4 equal groups: [10, 10, 10, 10]
+        let c_equal = [10.0, 10.0, 10.0, 10.0];
+        let (s_eq, capped_eq) = solve_water_filling(&c_equal, 0.25);
+        assert!((s_eq - 40.0).abs() < 1e-9);
+        assert_eq!(capped_eq, vec![10.0, 10.0, 10.0, 10.0]);
+
+        // Dominant group: [100, 1, 1, 1]
+        // S = 4.0, dominant group is capped at 0.25 * 4.0 = 1.0
+        let c_dom = [100.0, 1.0, 1.0, 1.0];
+        let (s_dom, capped_dom) = solve_water_filling(&c_dom, 0.25);
+        assert!((s_dom - 4.0).abs() < 1e-9);
+        assert!((capped_dom[0] - 1.0).abs() < 1e-9);
+        assert_eq!(capped_dom[1..], [1.0, 1.0, 1.0]);
+
+        // Capped sum equals S
+        let c_mixed = [5.0, 5.0, 5.0, 5.0, 20.0];
+        let (s_mixed, capped_mixed) = solve_water_filling(&c_mixed, 0.25);
+        let sum_capped: f64 = capped_mixed.iter().sum();
+        assert!((s_mixed - sum_capped).abs() < 1e-9);
+        // And no single group exceeds f_max * S
+        for &c_prime in &capped_mixed {
+            assert!(c_prime <= 0.25 * s_mixed + 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_hierarchical_group_isolation_and_global_evidence() {
+        let mut cfg = AdaptiveConfig::adaptive();
+        cfg.c_min_dest = 1;
+        cfg.c_max_dest = 20;
+        cfg.c_min_global = 1;
+        cfg.c_max_global = 100;
+        let mut ctrl = ConcurrencyController::new(&cfg);
+
+        // Create 4 groups
+        let g1 = 1;
+        let g2 = 2;
+        let g3 = 3;
+        let g4 = 4;
+
+        let d1 = 10;
+        let d2 = 20;
+        let d3 = 30;
+        let d4 = 40;
+
+        ctrl.set_dest_group(d1, g1);
+        ctrl.set_dest_group(d2, g2);
+        ctrl.set_dest_group(d3, g3);
+        ctrl.set_dest_group(d4, g4);
+
+        // Initialize windows: ramp all groups to window 10
+        for _ in 0..10 {
+            for &did in &[d1, d2, d3, d4] {
+                ctrl.record_dest_outcome(did, ProbeOutcome::SuccessInitial {
+                    rtt: Duration::from_millis(20),
+                });
+            }
+            ctrl.apply_epoch();
+        }
+
+        let g1_win_before = ctrl.get_group(g1).unwrap().window.window();
+        let g2_win_before = ctrl.get_group(g2).unwrap().window.window();
+        let global_win_before = ctrl.global.window();
+        assert!(g1_win_before > 1);
+
+        // Test Isolation: G1 experiences packet loss, G2..G4 are lossless
+        ctrl.record_dest_outcome(d1, ProbeOutcome::InferredLoss);
+        for &did in &[d2, d3, d4] {
+            ctrl.record_dest_outcome(did, ProbeOutcome::SuccessInitial {
+                rtt: Duration::from_millis(20),
+            });
+        }
+        ctrl.apply_epoch();
+
+        // G1 window decreased
+        let g1_win_after = ctrl.get_group(g1).unwrap().window.window();
+        assert!(g1_win_after < g1_win_before, "G1 window must decrease on G1 loss");
+
+        // G2 window did NOT decrease (group loss is isolated)
+        let g2_win_after = ctrl.get_group(g2).unwrap().window.window();
+        assert!(g2_win_after >= g2_win_before, "G2 window must not decrease from G1 loss");
+
+        // Global window did NOT decrease because G_min = 4 groups are required for global evidence
+        let global_win_after = ctrl.global.window();
+        assert!(
+            global_win_after >= global_win_before,
+            "Global window must NOT decrease from a single group's localized loss"
+        );
+
+        // Now: ALL 4 groups experience loss -> global evidence condition holds!
+        ctrl.record_dest_outcome(d1, ProbeOutcome::InferredLoss);
+        ctrl.record_dest_outcome(d2, ProbeOutcome::InferredLoss);
+        ctrl.record_dest_outcome(d3, ProbeOutcome::InferredLoss);
+        ctrl.record_dest_outcome(d4, ProbeOutcome::InferredLoss);
+        ctrl.apply_epoch();
+
+        // Now global window must decrease!
+        let global_win_final = ctrl.global.window();
+        assert!(
+            global_win_final < global_win_after,
+            "Global window must decrease when all 4 groups exhibit loss satisfying global evidence"
+        );
+    }
+
+    #[test]
+    fn test_atomic_hierarchical_pacing() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut ctrl = ConcurrencyController::new(&cfg);
+
+        let d1 = 100;
+        let g1 = 10;
+        ctrl.set_dest_group(d1, g1);
+
+        // Set global pacer = 10ms interval, group pacer = 20ms interval, dest pacer = 50ms interval
+        ctrl.set_pacer(None, None, Duration::from_millis(10));
+        ctrl.set_pacer(None, Some(g1), Duration::from_millis(20));
+        ctrl.set_pacer(Some(d1), None, Duration::from_millis(50));
+
+        let t0 = Duration::ZERO;
+        // First transmit at t0 should succeed across all pacers atomically
+        let res1 = ctrl.try_acquire_pacing(d1, t0);
+        assert!(res1.is_ok(), "First acquisition should succeed");
+
+        // Immediate retry at t0 should fail because dest requires 50ms, group requires 20ms, global requires 10ms
+        let res2 = ctrl.try_acquire_pacing(d1, t0);
+        assert_eq!(
+            res2,
+            Err(Duration::from_millis(50)),
+            "Should require waiting for slowest pacer (50ms)"
+        );
+
+        // Attempt at 25ms: global (ready) and group (ready), but dest (needs 50ms) -> atomic failure!
+        let res3 = ctrl.try_acquire_pacing(d1, Duration::from_millis(25));
+        assert_eq!(res3, Err(Duration::from_millis(50)));
+
+        // Because it failed atomically, global and group next_tx must NOT have been consumed at 25ms!
+        // Another destination d2 in group g2 (no dest pacer, no group pacer, only global pacer)
+        let d2 = 200;
+        // Global was set at t0 + 10ms = 10ms. At 25ms, global IS ready!
+        let res_d2 = ctrl.try_acquire_pacing(d2, Duration::from_millis(25));
+        assert!(res_d2.is_ok(), "d2 should succeed because global pacer was not corrupted");
+
+        // Advance to 50ms: d1 now succeeds across all scopes!
+        let res4 = ctrl.try_acquire_pacing(d1, Duration::from_millis(50));
+        assert!(res4.is_ok(), "d1 should succeed at 50ms");
     }
 }

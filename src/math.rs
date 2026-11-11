@@ -181,6 +181,83 @@ pub fn one_minus_exp_neg_no_std(x: f64) -> f64 {
     (1.0 - exp_neg_x).clamp(0.0, 1.0)
 }
 
+/// Compute ceiling of `x` in a portable, `no_std`-compatible way.
+#[inline]
+pub fn ceil_f64(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.ceil()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        if !x.is_finite() || x == 0.0 {
+            return x;
+        }
+        let truncated = x as i64 as f64;
+        if x > 0.0 && x > truncated {
+            truncated + 1.0
+        } else {
+            truncated
+        }
+    }
+}
+
+/// Compute floor of `x` in a portable, `no_std`-compatible way.
+#[inline]
+pub fn floor_f64(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.floor()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        if !x.is_finite() || x == 0.0 {
+            return x;
+        }
+        let truncated = x as i64 as f64;
+        if x < 0.0 && x < truncated {
+            truncated - 1.0
+        } else {
+            truncated
+        }
+    }
+}
+
+/// Compute square root of `x` in a portable, `no_std`-compatible way.
+#[inline]
+pub fn sqrt_f64(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.sqrt()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        if !x.is_finite() {
+            if x.is_nan() || x < 0.0 {
+                return f64::NAN;
+            }
+            return f64::INFINITY;
+        }
+        if x <= 0.0 {
+            return 0.0;
+        }
+        let mut curr = x;
+        if curr > 1.0 {
+            curr = x * 0.5;
+        }
+        for _ in 0..24 {
+            let next = 0.5 * (curr + x / curr);
+            let diff = next - curr;
+            let abs_diff = if diff < 0.0 { -diff } else { diff };
+            if abs_diff <= 1e-15 * curr {
+                return next;
+            }
+            curr = next;
+        }
+        curr
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

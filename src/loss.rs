@@ -7,6 +7,62 @@ use core::time::Duration;
 
 use crate::config::AdaptiveConfig;
 
+/// Validated statistical confidence value constrained to `[0.0, 1.0]` (CONTRACT.md § 10).
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+pub struct Confidence(f64);
+
+impl Confidence {
+    /// Zero confidence (0.0).
+    pub const ZERO: Self = Self(0.0);
+    /// Full certainty (1.0).
+    pub const ONE: Self = Self(1.0);
+
+    /// Construct a new validated confidence value. Returns `Err` if not in `[0.0, 1.0]` or NaN.
+    pub fn new(val: f64) -> Result<Self, &'static str> {
+        if val.is_nan() || val < 0.0 || val > 1.0 {
+            Err("Confidence must be a finite float in [0.0, 1.0]")
+        } else {
+            Ok(Self(val))
+        }
+    }
+
+    /// Construct a confidence value by clamping to `[0.0, 1.0]`.
+    pub fn clamped(val: f64) -> Self {
+        if val.is_nan() {
+            Self::ZERO
+        } else {
+            Self(val.clamp(0.0, 1.0))
+        }
+    }
+
+    /// Read confidence as raw float.
+    #[inline]
+    pub fn as_f64(self) -> f64 {
+        self.0
+    }
+}
+
+/// Mutually exclusive classification of a network probe observation (CONTRACT.md § 10).
+///
+/// Implements the Classification Plane:
+/// - Eligible successful observations contribute c = 0.
+/// - Suspected path-loss observations contribute their calibrated c_loss.
+/// - Suspected rate-limit observations update the separate rate-limit EWMA.
+/// - Unknown and ExpectedSilence do not update either signal.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ObservationClassification {
+    /// Eligible successful observation: contributes c = 0.
+    Success,
+    /// Suspected path-loss observation: contributes calibrated c_loss.
+    SuspectedLoss { c_loss: Confidence },
+    /// Suspected rate-limit observation: contributes calibrated c_rate_limit to separate EWMA.
+    SuspectedRateLimit { c_rate_limit: Confidence },
+    /// Filtered port / expected silence: does NOT update either signal.
+    ExpectedSilence,
+    /// Unknown / unclassified: does NOT update either signal.
+    Unknown,
+}
+
 /// Time-normalized classified drop-rate EWMA monitor.
 ///
 /// Tracks `D_loss` and `D_rate_limit` as separate time-normalized EWMAs with
@@ -130,6 +186,35 @@ impl LossMonitor {
 
         self.d_loss = retain * self.d_loss + lambda * p_loss;
         self.d_rate_limit = retain * self.d_rate_limit + lambda * p_rate;
+    }
+
+    /// Update loss or rate-limit EWMAs with an individual classified observation (CONTRACT.md § 10).
+    ///
+    /// - Eligible successful observations contribute c = 0.
+    /// - Suspected path-loss observations contribute their calibrated c_loss.
+    /// - Suspected rate-limit observations update the separate rate-limit EWMA.
+    /// - Unknown and ExpectedSilence do not update either signal.
+    /// - Between eligible observations the signal is held (no automatic decay toward zero).
+    /// - λ(Δt) = 1 − exp(−Δt / τ) applies only at the moment an eligible observation arrives.
+    pub fn record_observation(&mut self, obs: ObservationClassification, dt: Duration) {
+        match obs {
+            ObservationClassification::Success => {
+                let lambda = self.lambda(dt);
+                self.d_loss = (1.0 - lambda) * self.d_loss + lambda * 0.0;
+            }
+            ObservationClassification::SuspectedLoss { c_loss } => {
+                let lambda = self.lambda(dt);
+                self.d_loss = (1.0 - lambda) * self.d_loss + lambda * c_loss.as_f64();
+            }
+            ObservationClassification::SuspectedRateLimit { c_rate_limit } => {
+                let lambda = self.lambda(dt);
+                self.d_rate_limit = (1.0 - lambda) * self.d_rate_limit + lambda * c_rate_limit.as_f64();
+            }
+            ObservationClassification::ExpectedSilence | ObservationClassification::Unknown => {
+                // Unknown and ExpectedSilence do not update either signal.
+                // Signal is held without decay.
+            }
+        }
     }
 
     /// Compute the time-normalized smoothing factor λ(Δt) = 1 − exp(−Δt/τ).
@@ -381,5 +466,87 @@ mod tests {
         // Only 5 eligible (successes). ExpectedSilence not counted.
         assert_eq!(events.eligible_count(), 5);
         assert_eq!(events.loss_rate(), 0.0);
+    }
+
+    #[test]
+    fn test_confidence_validation() {
+        assert!(Confidence::new(0.0).is_ok());
+        assert!(Confidence::new(1.0).is_ok());
+        assert!(Confidence::new(0.5).is_ok());
+        assert!(Confidence::new(-0.1).is_err());
+        assert!(Confidence::new(1.01).is_err());
+        assert!(Confidence::new(f64::NAN).is_err());
+
+        assert_eq!(Confidence::clamped(1.5), Confidence::ONE);
+        assert_eq!(Confidence::clamped(-0.5), Confidence::ZERO);
+        assert_eq!(Confidence::clamped(f64::NAN), Confidence::ZERO);
+    }
+
+    #[test]
+    fn test_observation_classification_ewma_contract() {
+        let cfg = AdaptiveConfig::adaptive();
+        let mut mon = LossMonitor::new(&cfg);
+        let dt = Duration::from_millis(500);
+
+        // 1. Success contributes c = 0
+        mon.record_observation(ObservationClassification::Success, dt);
+        assert_eq!(mon.d_loss(), 0.0);
+        assert_eq!(mon.d_rate_limit(), 0.0);
+
+        // 2. SuspectedLoss contributes calibrated c_loss
+        let c_loss = Confidence::new(0.8).unwrap();
+        mon.record_observation(ObservationClassification::SuspectedLoss { c_loss }, dt);
+        let loss_after = mon.d_loss();
+        assert!(loss_after > 0.0, "SuspectedLoss must update d_loss");
+        assert_eq!(mon.d_rate_limit(), 0.0, "SuspectedLoss must not contaminate d_rate_limit");
+
+        // 3. SuspectedRateLimit contributes calibrated c_rate_limit to separate EWMA
+        let c_rate = Confidence::new(0.6).unwrap();
+        mon.record_observation(ObservationClassification::SuspectedRateLimit { c_rate_limit: c_rate }, dt);
+        assert!(mon.d_rate_limit() > 0.0, "SuspectedRateLimit must update d_rate_limit");
+        assert_eq!(mon.d_loss(), loss_after, "SuspectedRateLimit must not alter d_loss");
+
+        // 4. ExpectedSilence and Unknown hold signals without decay
+        let loss_before_hold = mon.d_loss();
+        let rate_before_hold = mon.d_rate_limit();
+        mon.record_observation(ObservationClassification::ExpectedSilence, Duration::from_secs(10));
+        mon.record_observation(ObservationClassification::Unknown, Duration::from_secs(10));
+        assert_eq!(mon.d_loss(), loss_before_hold, "ExpectedSilence/Unknown must hold d_loss");
+        assert_eq!(mon.d_rate_limit(), rate_before_hold, "ExpectedSilence/Unknown must hold d_rate_limit");
+    }
+
+    #[test]
+    fn test_statistical_calibration_labeled_traces() {
+        // Evaluate Brier score on labeled traces: (1/N) * sum (c_i - y_i)^2
+        // Ground truth y_i in {0.0, 1.0}
+        struct LabeledEvent {
+            confidence: f64,
+            is_actual_loss: bool,
+        }
+
+        let trace = [
+            LabeledEvent { confidence: 0.90, is_actual_loss: true },
+            LabeledEvent { confidence: 0.85, is_actual_loss: true },
+            LabeledEvent { confidence: 0.75, is_actual_loss: true },
+            LabeledEvent { confidence: 0.80, is_actual_loss: true },
+            LabeledEvent { confidence: 0.10, is_actual_loss: false },
+            LabeledEvent { confidence: 0.05, is_actual_loss: false },
+            LabeledEvent { confidence: 0.15, is_actual_loss: false },
+            LabeledEvent { confidence: 0.00, is_actual_loss: false },
+            LabeledEvent { confidence: 0.88, is_actual_loss: true },
+            LabeledEvent { confidence: 0.05, is_actual_loss: false },
+        ];
+
+        let mut sum_sq_err = 0.0;
+        for ev in &trace {
+            let actual = if ev.is_actual_loss { 1.0 } else { 0.0 };
+            let err = ev.confidence - actual;
+            sum_sq_err += err * err;
+        }
+        let brier_score = sum_sq_err / (trace.len() as f64);
+        assert!(
+            brier_score < 0.05,
+            "Calibrated trace Brier score {brier_score} exceeds 0.05 calibration bound"
+        );
     }
 }

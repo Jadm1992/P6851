@@ -21,13 +21,22 @@ pub mod change_detector;
 pub mod rto;
 pub mod concurrency;
 pub mod loss;
+pub mod execution;
 pub mod engine;
 
 pub use config::*;
 pub use rtt::RttEstimator;
-pub use p95::RollingP95;
+pub use p95::{BlockBasedP95Gate, QuantileEstimate, RollingP95, RttHistogram};
 pub use change_detector::ChangeDetector;
 pub use rto::ProbeRetrySchedule;
-pub use concurrency::{AimdWindow, ConcurrencyController, DestinationTracker};
-pub use loss::{EpochEvents, LossMonitor};
+pub use concurrency::{
+    solve_water_filling, AimdWindow, ConcurrencyController, DestinationTracker, GroupTracker,
+    Pacer,
+};
+pub use loss::{Confidence, EpochEvents, LossMonitor, ObservationClassification};
+pub use execution::{
+    ArenaError, CancellationGuard, CancellationQueue, CancellationSink, DestinationArena,
+    DestinationHandle, ExecutionCoordinator, GroupArena, GroupHandle, PermitError, PermitState,
+    ProbeId, ProbePermit,
+};
 pub use engine::{AdaptiveEngine, TelemetrySnapshot, Timestamp};
