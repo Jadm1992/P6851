@@ -1,0 +1,12 @@
+[package]
+name = "rfc6298-optimization"
+version = "0.1.0"
+edition = "2024"
+description = "RFC 6298 adaptive RTT estimation, RTO computation, AIMD concurrency control, and classified loss monitoring"
+
+[features]
+default = ["std"]
+std = []
+
+[dev-dependencies]
+proptest = "1"
