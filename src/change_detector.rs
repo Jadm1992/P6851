@@ -59,20 +59,24 @@ impl EpochAccumulator {
 
     /// Compute Mean Absolute Deviation (MAD) of samples around the given median.
     ///
-    /// MAD = (1/N) * sum(|R_i - M_e|)
+    /// \[ \text{MAD} = \frac{1}{N} \sum_{i=1}^N |R_i - M_e| \]
+    ///
+    /// Evaluated in full nanosecond precision with checked accumulation and safe
+    /// conversion back to [`Duration`] without integer truncation.
     pub fn mean_absolute_deviation(&self, median: Duration) -> Duration {
         if self.samples.is_empty() {
             return Duration::ZERO;
         }
-        let mut sum_diff_micros: u128 = 0;
-        let med_micros = median.as_micros();
+        let med_nanos = median.as_nanos();
+        let mut sum_diff_nanos: u128 = 0;
         for &s in &self.samples {
-            let s_micros = s.as_micros();
-            let diff = s_micros.abs_diff(med_micros);
-            sum_diff_micros += diff;
+            let diff = s.as_nanos().abs_diff(med_nanos);
+            sum_diff_nanos = sum_diff_nanos.saturating_add(diff);
         }
-        let avg_diff_micros = sum_diff_micros / (self.samples.len() as u128);
-        Duration::from_micros(avg_diff_micros as u64)
+        let avg_diff_nanos = sum_diff_nanos / (self.samples.len() as u128);
+        let secs = (avg_diff_nanos / 1_000_000_000) as u64;
+        let subsec_nanos = (avg_diff_nanos % 1_000_000_000) as u32;
+        Duration::new(secs, subsec_nanos)
     }
 
     /// Drain and reset for the next epoch.
@@ -161,6 +165,15 @@ impl ChangeDetector {
         }
 
         // Epochs with fewer than n_min samples preserve the counter (§ 1.5 item 1).
+        //
+        // Formal Interpretation:
+        // The detector enforces `m` consecutive *valid observation epochs* that violate the baseline.
+        // Under § 1.5 item 1 of the frozen mathematical contract:
+        //   "(Epochs with fewer than n_min eligible samples preserve the current violation counter
+        //    without incrementing or resetting it.)"
+        // Sparse/idle epochs containing insufficient samples act as transparent pauses, preserving
+        // the counter rather than resetting it, to prevent low probe volume from masking a real
+        // sustained shift. Any subsequent valid epoch that does not violate the baseline resets `v <- 0`.
         if acc.len() < self.min_samples {
             return EpochCloseResult::InsufficientSamples;
         }
@@ -345,6 +358,16 @@ mod tests {
         let acc = make_acc(&[1000, 1000, 1000]);
         let result = det.close_epoch(&acc, Duration::from_millis(100), Duration::from_millis(10));
         assert_eq!(result, EpochCloseResult::Normal);
+    }
+
+    #[test]
+    fn mad_nanosecond_precision() {
+        let mut acc = EpochAccumulator::new();
+        // 100ns and 300ns around median 200ns -> MAD = (100ns + 100ns)/2 = 100ns
+        acc.push(Duration::from_nanos(100));
+        acc.push(Duration::from_nanos(300));
+        let mad = acc.mean_absolute_deviation(Duration::from_nanos(200));
+        assert_eq!(mad, Duration::from_nanos(100));
     }
 
     #[test]
